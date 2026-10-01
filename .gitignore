@@ -28,3 +28,6 @@ benchmark/server
 mt-tools/data/
 mt-tools/.venv/
 mt-tools/uv.lock
+/gpu-admin-tools/
+/private/
+persistent-worker-*.img

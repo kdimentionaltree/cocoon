@@ -107,6 +107,8 @@ class Config:
     model_verity_hash: str | None = None
 
     # QEMU/hardware
+    cpus: int | None = None
+    ram: str | None = None
     gpu: str | None = None
     persistent: str | None = None
     ssh_port: int | None = None
@@ -137,7 +139,7 @@ class Config:
             ('TON configs', ['ton_config_base', 'ton_config']),
             ('Paths', ['image_dir', 'build_dir', 'local_run_dir', 'model_tar_path', 'prepared_spec_dir']),
             ('Model', ['model_commit', 'model_verity_hash']),
-            ('QEMU/hardware', ['gpu', 'persistent', 'ssh_port', 'vsock_cid', 'tcp_ports', 'no_tee', 'guestfwd_ip', 'guestfwd_ports']),
+            ('QEMU/hardware', ['cpus', 'ram', 'gpu', 'persistent', 'ssh_port', 'vsock_cid', 'tcp_ports', 'no_tee', 'guestfwd_ip', 'guestfwd_ports']),
             ('Extra', ['prepare_only', 'print_only', 'skip_build', 'just_build']),
         ]
 
@@ -225,6 +227,28 @@ def this_cpu_vendor() -> CPUVendor:
             return CPUVendor.AMD
 
     raise RuntimeError (f"Uknown CPUVendor: {vendor_id} STDOUT:'{stdout}', STDERR:'{stderr}'")
+
+@functools.cache
+def available_ram_bytes() -> int:
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    raise RuntimeError("MemAvailable not found")
+
+def parse_qemu_ram(value: str, *, for_m_option: bool = False) -> int:
+    """Return bytes from an integer QEMU size, e.g. '16G' or '512M'."""
+    match = re.fullmatch(r"([0-9]+)([KMGTPEkmgtpe]?)", value.strip())
+    if not match:
+        raise ValueError(f"Invalid RAM size: {value!r}")
+    amount = int(match[1])
+    suffix = match[2].upper()
+    multiplier = (
+        1024 ** ("KMGTPE".index(suffix) + 1)
+        if suffix
+        else (1024**2 if for_m_option else 1)
+    )
+    return amount * multiplier
 
 def qemu_confidential_guest_support(cpu_vendor : CPUVendor) -> str:
     match cpu_vendor:
@@ -322,6 +346,8 @@ def load_config_from_file(cli_args) -> Config:
         build_dir=get('build_dir', build_dir),
         prepared_spec_dir=prepared_spec_dir,
         # QEMU/hardware
+        cpus=getint('cpus', 32),
+        ram=get('ram', '100G'),
         gpu=get('gpu'),
         persistent=get('persistent', f'persistent-{node_type}-{instance}.img'),
         ssh_port=getint('ssh_port', None),
@@ -604,6 +630,19 @@ def run_qemu(cfg: Config):
 
         if not model_verity_file.exists():
             sys.exit(f'ERROR: Model .tar.verity file not found: {model_verity_file}')
+    # Check CPUs and RAM
+    if not cfg.cpus:
+        cfg.cpus = 32
+
+    available_cpus = len(os.sched_getaffinity(0))
+    if available_cpus < cfg.cpus:
+        sys.exit(f"Requested {cfg.cpus} cpu cores, but only {available_cpus} found")
+
+    if not cfg.ram:
+        cfg.ram = '100G'
+    # check if enough ram + headroom
+    if available_ram_bytes() < parse_qemu_ram(cfg.ram) + 4 * 1024**3:
+        sys.exit(f"Insufficient RAM, including 4 GiB host headroom. Requested {cfg.ram}")
 
     # Create persistent disk
     if cfg.persistent and not Path(cfg.persistent).exists():
@@ -657,10 +696,10 @@ def run_qemu(cfg: Config):
     qemu = ['qemu-system-x86_64',
             '-machine', machine,
             '-bios', str(ovmf),
-            '-accel', 'kvm', '-cpu', 'host', '-smp', '32',
+            '-accel', 'kvm', '-cpu', 'host', '-smp', f'{cfg.cpus}',
             '-vga', 'none',
             *tee_obj,
-            '-object', 'memory-backend-ram,id=mem0,size=100G',
+            '-object', f'memory-backend-ram,id=mem0,size={cfg.ram}',
             '-device', f'vhost-vsock-pci,guest-cid={vsock_cid}',
             '-object', 'iommufd,id=iommufd0',
             '-device', 'pcie-root-port,id=pci.0,bus=pcie.0',
@@ -905,6 +944,8 @@ def parse_args():
     parser.add_argument('-d', '--debug', action='store_true')
     parser.add_argument('--instance', type=int)
     parser.add_argument('--persistent', help='Persistent disk image')
+    parser.add_argument('--cpus', type=int, help='Number of CPU cores (default: 32)')
+    parser.add_argument('--ram', type=str, help='Amount of RAM (default: 100G)')
     parser.add_argument('--gpu', help='GPU PCI address')
     parser.add_argument('--ssh-port', type=int)
     parser.add_argument('--vsock-cid', type=int)
