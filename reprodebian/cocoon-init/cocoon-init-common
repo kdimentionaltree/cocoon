@@ -159,8 +159,12 @@ generate_tee_certificate() {
   # Generate certificate and key with TEE attestation
   # Uses gen-cert-synced to ensure certificate time is synchronized with TON
   echo "Generating TEE certificate and key with synchronized time..."
+  local tee_mode=tee
+  if grep -qw cocoon_no_tee /proc/cmdline; then
+    tee_mode=fake_tee
+  fi
   export cert_base="$CERT_DIR/tee"
-  if ! gen-cert-synced --tee tee --name "$cert_base" --force; then
+  if ! gen-cert-synced --tee "$tee_mode" --name "$cert_base" --force; then
     echo "ERR: Failed to generate certificate and key" >&2
     exit 1
   fi

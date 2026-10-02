@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# init.sh - initialization script for debug without TDX
+set -euo pipefail
+
+RPATH=$(dirname "${BASH_SOURCE[0]}")
+
+. "${RPATH}"/cocoon-init-common
+
+generate_tee_certificate

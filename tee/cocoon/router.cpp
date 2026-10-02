@@ -55,7 +55,7 @@ td::Status parse_list_of_hex(td::Slice list, std::vector<T> &hashes) {
 
 // Create policies from configuration
 std::map<std::string, cocoon::RATLSPolicyRef, std::less<>> create_policies_from_config(td::actor::Scheduler *scheduler,
-                                                                                       const ProxyConfig &config) {
+                                                                                       const ProxyConfig &config, bool no_tee) {
   std::map<std::string, cocoon::RATLSPolicyRef, std::less<>> policies;
 
   // Create shared attestation cache for all TDX policies
@@ -64,6 +64,10 @@ std::map<std::string, cocoon::RATLSPolicyRef, std::less<>> create_policies_from_
 
   // Add custom policies from configuration
   for (const auto &policy_config : config.policies) {
+    if (no_tee && policy_config.type == "tee") {
+      continue;
+    }
+
     cocoon::RATLSInterfaceRef ratls = nullptr;
 
     // Might be filled from policy_config
@@ -99,6 +103,7 @@ struct CliArgs {
   int threads = 0;
   bool generate_config = false;
   bool default_serialize_info = false;
+  bool no_tee = false;
   std::vector<td::UInt384> global_collateral_root_hashes;  // Applied to all policies
   td::int32 global_pow_difficulty = 20;
   td::int32 global_max_pow_difficulty = 28;
@@ -422,6 +427,9 @@ int main(int argc, char **argv) {
   option_parser.add_option('g', "generate-config", "generate example configuration file",
                            [&]() { args.generate_config = true; });
 
+  option_parser.add_option(0, "no-tee", "disable real attestation policies for debugging",
+                           [&]() { args.no_tee = true; });
+
   option_parser.add_option('h', "help", "Show this help message", [&]() {
     LOG(PLAIN) << option_parser;
     std::_Exit(0);
@@ -513,7 +521,7 @@ int main(int argc, char **argv) {
   td::actor::Scheduler sched{{config.threads}};
 
   // Create policies
-  auto policies = create_policies_from_config(&sched, config);
+  auto policies = create_policies_from_config(&sched, config, args.no_tee);
 
   // Load certificate
   cocoon::TeeCertAndKey cert_and_key;

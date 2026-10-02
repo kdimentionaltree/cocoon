@@ -84,6 +84,7 @@ class Config:
     # Runtime control
     test: bool = False
     fake_ton: bool = False  # Disable real TON, use fake TON for testing
+    no_cc: bool = False # Disable CC mode for debug
     local_mode: bool = False  # True for --local-all and local client execution
     instance: int = 0
 
@@ -134,7 +135,7 @@ class Config:
         sections = [
             ('Common', ['root_contract_address', 'model', 'external_ip', 'external_worker_port',
                         'external_client_port', 'external_key_manager_port', 'node_wallet_key']),
-            ('Runtime', ['test', 'fake_ton', 'local_mode', 'instance']),
+            ('Runtime', ['test', 'fake_ton', 'no_cc', 'local_mode', 'instance']),
             ('Worker', ['worker_coefficient', 'hf_token']),
             ('TON configs', ['ton_config_base', 'ton_config']),
             ('Paths', ['image_dir', 'build_dir', 'local_run_dir', 'model_tar_path', 'prepared_spec_dir']),
@@ -312,6 +313,7 @@ def load_config_from_file(cli_args) -> Config:
 
     # Auto-spec
     spec = cli_args.spec or str(script_dir / 'spec' / f'spec-{node_type}')
+    no_cc = getbool('no_cc', False)
     fake_ton = getbool('fake_ton', False)
     test = getbool('test', False)
 
@@ -332,6 +334,7 @@ def load_config_from_file(cli_args) -> Config:
         # Runtime control
         test=test,
         fake_ton=fake_ton,
+        no_cc=no_cc,
         instance=instance,
         # Worker-specific
         worker_coefficient=get('worker_coefficient', '1000'),
@@ -429,6 +432,28 @@ def adjust_runner_services(spec_dir: str, fake_ton: bool) -> None:
 
         with open(path, 'w', encoding='utf-8') as f:
             f.writelines(lines)
+
+
+def adjust_router_service(spec_dir: str, no_tee: bool) -> None:
+    if not no_tee:
+        return
+
+    path = Path(spec_dir) / 'cocoon-router.service'
+    if not path.exists():
+        return
+
+    lines = path.read_text().splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith('ExecStart=/usr/bin/router '):
+            if '--no-tee' not in line.split():
+                line = line.replace(
+                    'ExecStart=/usr/bin/router ',
+                    'ExecStart=/usr/bin/router --no-tee ',
+                    1,
+                )
+            lines[i] = re.sub(r'@tee(?=[:\s]|$)', '@fake_tee', line)
+
+    path.write_text('\n'.join(lines) + '\n')
 
 
 def print_spec_info(cfg: Config):
@@ -551,6 +576,9 @@ def prepare_spec(cfg: Config):
     # Adjust service files for fake-ton mode
     adjust_runner_services(dest, cfg.fake_ton)
 
+    # Adjust router service for no tee mode
+    adjust_router_service(dest, cfg.no_tee)
+
 
 def render_configs_local(cfg: Config):
     """Render configs for local execution"""
@@ -585,7 +613,11 @@ def run_client_local(cfg: Config):
 
     # Start router (SOCKS5 only, no reverse proxy) with colored output
     router = f'{cfg.build_dir}/tee/router'
-    router_proc = popen([router, '-S', '8116@tee', '--serialize-info'],
+    policy = 'fake_tee' if cfg.no_tee else 'tee'
+    router_cmd = [router, '-S', f'8116@{policy}', '--serialize-info']
+    if cfg.no_tee:
+        router_cmd.append('--no-tee')
+    router_proc = popen(router_cmd,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     router_thread = threading.Thread(target=stream_output, args=(router_proc, 'ROUTER', '36'), daemon=True)
     router_thread.start()
@@ -671,6 +703,10 @@ def run_qemu(cfg: Config):
         cmdline += ' cocoon_debug'
     if cfg.fake_ton:
         cmdline += ' cocoon_fake_ton'
+    if cfg.no_cc or cfg.no_tee:
+        cmdline += ' cocoon_no_cc'
+    if cfg.no_tee:
+        cmdline += ' cocoon_no_tee'
     cmdline += ' cocoon_gpu' if cfg.gpu else ' modprobe.blacklist=nvidia'
 
     # Check OVMF
@@ -934,6 +970,7 @@ def parse_args():
     parser.add_argument('--test', action='store_true', default=None, help='Test mode (debug shell, SSH)')
     parser.add_argument('--fake-ton', '--pseudo', action='store_true', default=None, dest='fake_ton',
                         help='Fake-TON mode (disable real TON network)')
+    parser.add_argument('--no-cc', action='store_true', default=None, help='Disable NVIDIA Confidential Computing for debug')
     parser.add_argument('--local-all', action='store_true', help='Run all components locally')
     parser.add_argument('--prepare-only', action='store_true', help='Prepare spec to /tmp/spec/')
     parser.add_argument('--print-only', action='store_true', help='Print command and exit')

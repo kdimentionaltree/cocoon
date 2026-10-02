@@ -31,3 +31,6 @@ mt-tools/uv.lock
 /gpu-admin-tools/
 /private/
 persistent-worker-*.img
+persistent-proxy-*.img
+persistent-key-manager-*.img
+

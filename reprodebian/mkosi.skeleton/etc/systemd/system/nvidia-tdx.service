@@ -3,6 +3,7 @@ Description=NVIDIA Confidential Compute
 Wants=nvidia-persistenced.service network-online.target
 After=nvidia-persistenced.service network-online.target
 ConditionKernelCommandLine=cocoon_gpu
+ConditionKernelCommandLine=!cocoon_no_cc
 
 [Service]
 Type=oneshot

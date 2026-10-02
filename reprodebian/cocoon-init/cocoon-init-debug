@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# init.sh - initialization script for debug without TDX
+set -euo pipefail
+
+RPATH=$(dirname "${BASH_SOURCE[0]}")
+
+. "${RPATH}"/cocoon-init-common
+
+is_debug=true
+IS_DEBUG_INT=1
+
+make_seal_keys() {
+  local key_spec key_file
+
+  for key_spec in "${KEYS[@]}"; do
+    key_file="$CERT_DIR/${key_spec##*:}"
+    printf '%s' 'cococooncococooncococooncococoon' > "$key_file"
+    chmod 400 "$key_file"
+  done
+
+  key_hash=$(sha256sum "$SEALED_KEY_FILE" | awk '{print $1}')
+  printf '%s\n' "$key_hash" > "$KEY_HASH_FILE"
+  chmod 400 "$KEY_HASH_FILE"
+}
+
+echo "=== Debug Guest Initialization ==="
+create_secure_directories
+
+echo "Preparing specification..."
+spec_hash=$(prepare_spec)
+echo "Specification prepared successfully"
+echo "Spec hash: $spec_hash"
+
+make_seal_keys
+echo "Spec preparation completed, configs will be rendered by init scripts"
+
+render_ton_config
+generate_tee_certificate
+generate_system_vars
+setup_persistent_disk
+fix_permissions
+print_final_status
+
+echo "=== Debug Status ==="
+echo "Debug guest is ready for debugging workloads"

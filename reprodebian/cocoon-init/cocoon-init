@@ -6,6 +6,11 @@ RPATH=$(dirname "${BASH_SOURCE[0]}")
 
 cpu_vendor_id=$(grep -m1 vendor_id /proc/cpuinfo | awk '{printf $3}')
 
+if grep -qw cocoon_no_tee /proc/cmdline;
+then
+    exec "${RPATH}/cocoon-init-debug" "$@"
+fi
+
 if [ "x${cpu_vendor_id}" == "xGenuineIntel" ]
 then
     exec ${RPATH}/cocoon-init-tdx "$@"

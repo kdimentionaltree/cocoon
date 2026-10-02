@@ -5,4 +5,4 @@ Requires=cocoon-ready.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/gen-cert-synced --tee tee --name /etc/tee/tee --force
+ExecStart=/usr/bin/cocoon-cert-refresh
