@@ -24,6 +24,10 @@ set(COCOON_SOURCE
         cocoon/utils.h
         cocoon/ProxyConfig.cpp
         cocoon/ProxyConfig.h
+        cocoon/tun-device.cpp
+        cocoon/tun-device.h
+        cocoon/ip-tunnel.cpp
+        cocoon/ip-tunnel.h
         cocoon/RATLS.h
         cocoon/RATLS.cpp
         cocoon/Tee.h
@@ -126,6 +130,10 @@ target_include_directories(test-cocoon SYSTEM PRIVATE $<BUILD_INTERFACE:${OPENSS
 
 add_executable(gen-cert EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/cocoon/gen-cert.cpp)
 target_link_libraries(gen-cert PRIVATE cocoon tdutils tdnet_ported tdactor)
+
+add_executable(test-ip-tunnel EXCLUDE_FROM_ALL test/ip-tunnel.cpp ../ton/test/test-td-main.cpp)
+target_link_libraries(test-ip-tunnel PRIVATE cocoon tdactor tdnet_ported)
+target_include_directories(test-ip-tunnel SYSTEM PRIVATE $<BUILD_INTERFACE:${OPENSSL_INCLUDE_DIR}>)
 
 add_executable(router EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/cocoon/router.cpp)
 target_link_libraries(router PRIVATE cocoon tdutils tdnet_ported tdactor)

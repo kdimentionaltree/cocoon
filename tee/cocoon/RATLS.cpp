@@ -36,6 +36,11 @@ class DefaultPolicy : public RATLSPolicy {
   }
 
   td::Result<RATLSAttestationReport> validate(const tde2e_core::PublicKey &public_key) const override {
+    // reject certificates without attestation
+    if (ratls_) {
+      return td::Status::Error("Attestation extensions are required");
+    }
+
     // This is the special case when no expected extensions are present by client side
     if (config_.tdx_config.allowed_image_hashes.empty() && config_.sev_config.allowed_image_hashes.empty()) {
       // Just treat at tdx attestation report

@@ -3,12 +3,14 @@
 #include "cocoon/AttestationCache.h"
 #include "ProxyConfig.h"
 #include "RevProxy.h"
+#include "ip-tunnel.h"
 #include "common/bitstring.h"
 #include "td/utils/logging.h"
 #include "td/utils/OptionParser.h"
 #include "td/utils/as.h"
 #include "td/utils/port/signals.h"
 #include "tdactor/td/actor/actor.h"
+#include <atomic>
 #include <iostream>
 #include <map>
 #include <set>
@@ -79,7 +81,7 @@ std::map<std::string, cocoon::RATLSPolicyRef, std::less<>> create_policies_from_
       ratls = cocoon::RATLSInterface::make(scheduler, true, config).move_as_ok();
     } else if (policy_config.type == "tee") {
       ratls = cocoon::RATLSInterface::add_cache(cocoon::RATLSInterface::make(scheduler, false, config).move_as_ok(),
-                                                std::move(attestation_cache))
+                                                attestation_cache)
                   .move_as_ok();
     } else {
       LOG(WARNING) << "Unknown policy type: " << policy_config.type << ", using 'any'";
@@ -511,28 +513,43 @@ int main(int argc, char **argv) {
     }
   }
 
-  if (config.ports.empty()) {
-    LOG(ERROR) << "No ports configured. Use --port or --config to specify ports.";
+  auto validation = cocoon::validate_proxy_config(config);
+  if (validation.is_error()) {
+    LOG(ERROR) << "Invalid router configuration: " << validation;
     LOG(ERROR) << "Use --generate-config to see example configuration.";
     return 1;
   }
 
   // Start scheduler
+  std::atomic<int> exit_code{0};
   td::actor::Scheduler sched{{config.threads}};
 
+  std::vector<cocoon::IpTunnel::Config> tunnels;
+  for (const auto &tunnel : config.tunnels) {
+    auto result = cocoon::IpTunnel::prepare(tunnel);
+    if (result.is_error()) {
+      LOG(ERROR) << "Failed to prepare tunnel '" << tunnel.name << "': " << result.error();
+      return 1;
+    }
+    tunnels.push_back(result.move_as_ok());
+  }
+
   // Create policies
-  auto policies = create_policies_from_config(&sched, config, args.no_tee);
+  std::map<std::string, cocoon::RATLSPolicyRef, std::less<>> policies;
+  if (!config.ports.empty()) {
+    policies = create_policies_from_config(&sched, config, args.no_tee);
+  }
 
   // Load certificate
   cocoon::TeeCertAndKey cert_and_key;
-  if (!config.cert_base_name.empty()) {
+  if (!config.ports.empty() && !config.cert_base_name.empty()) {
     auto r_cert = cocoon::load_cert_and_key(config.cert_base_name);
     if (r_cert.is_error()) {
       LOG(ERROR) << "Failed to load certificate: " << r_cert.error();
       return 1;
     }
     cert_and_key = r_cert.move_as_ok();
-  } else {
+  } else if (!config.ports.empty()) {
     LOG(WARNING) << "No certificate provided, generating test certificate";
     cert_and_key = cocoon::generate_cert_and_key(nullptr).move_as_ok();
   }
@@ -540,8 +557,17 @@ int main(int argc, char **argv) {
   td::SharedValue<cocoon::TeeCertAndKey> shared_cert(std::move(cert_and_key));
 
   sched.run_in_context([&] {
+    for (auto &tunnel : tunnels) {
+      auto name = "IpTunnel:" + tunnel.tunnel.name;
+      tunnel.on_error = [&](td::Status) {
+        exit_code.store(1);
+        td::actor::SchedulerContext::get().stop();
+      };
+      td::actor::create_actor<cocoon::IpTunnel>(
+          td::actor::ActorOptions().with_name(name).with_poll(true), std::move(tunnel)).release();
+    }
     // Start certificate manager if cert path is provided
-    if (!config.cert_base_name.empty()) {
+    if (!config.ports.empty() && !config.cert_base_name.empty()) {
       cocoon::CertManager::Config cert_manager_config;
       cert_manager_config.cert_base_name = config.cert_base_name;
       cert_manager_config.cert_and_key = shared_cert;
@@ -604,12 +630,12 @@ int main(int argc, char **argv) {
     }
   });
 
-  LOG(INFO) << "Proxies started";
+  LOG(INFO) << "Router services started";
   sched.start();
 
   while (sched.run(10)) {
     // empty
   }
 
-  return 0;
+  return exit_code.load();
 }

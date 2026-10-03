@@ -39,8 +39,27 @@ struct PortConfig {
   td::uint8 pow_difficulty = 20;      // Number of leading zero bits required (for reverse proxy)
   td::int32 max_pow_difficulty = 28;  // Max PoW difficulty client will solve (for forward/socks5 proxy)
 };
-
 td::StringBuilder &operator<<(td::StringBuilder &sb, const PortConfig &config);
+
+/**
+ * @brief Tunnel configuration
+ */
+struct TunnelConfig {
+  enum class TunnelMode { Client, Server };
+
+  std::string name;
+  TunnelMode tunnel_mode{TunnelMode::Client};
+  std::string interface;
+  std::string local_ipv4;
+  std::string peer_ipv4;
+  int mtu{1400};
+
+  std::string destination_host;
+  int destination_port{0};
+
+  std::string listen_host;
+  int listen_port{0};
+};
 
 /**
  * @brief Main proxy configuration
@@ -49,6 +68,7 @@ struct ProxyConfig {
   std::string cert_base_name;
   std::vector<PolicyConfig> policies;
   std::vector<PortConfig> ports;
+  std::vector<TunnelConfig> tunnels;
   int threads = 0;
 };
 
@@ -78,6 +98,11 @@ std::string generate_example_config();
  * @return Status indicating validation result
  */
 td::Status validate_port_config(const PortConfig &config);
+
+/**
+ * @brief Validate tunnel configuration
+ */
+td::Status validate_tunnel_config(const TunnelConfig &config);
 
 /**
  * @brief Validate proxy configuration
