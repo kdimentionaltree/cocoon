@@ -4,6 +4,19 @@ set -x
 
 echo "INIT WORKER RUNNER"
 
+BACKEND=sglang
+if [[ -f /spec/inference-backend ]]; then
+  BACKEND=$(cat /spec/inference-backend)
+fi
+case "$BACKEND" in
+  sglang|vllm) ;;
+  *) echo "Unsupported measured inference backend: $BACKEND" >&2; exit 1 ;;
+esac
+cocoon-render-config "cocoon-$BACKEND.service"
+if [[ -f /spec/wireguard-config.json ]]; then
+  cocoon-wireguard-prepare configure "$BACKEND"
+fi
+
 # Mount modle
 # For now using cocoon-render-config to get access to MODEL_VERITY_HASH
 cocoon-render-config model.verity_hash
@@ -17,10 +30,10 @@ cocoon-render-config worker-config.json
 # Render ton config
 cocoon-render-ton-config
 
-BACKEND=sglang
-cocoon-render-config cocoon-$BACKEND.service
-
 systemctl enable /spec/cocoon-router.service
 systemctl enable /spec/cocoon-worker-runner.service
 systemctl enable /run/spec/cocoon-$BACKEND.service
+if [[ -f /spec/wireguard-config.json ]]; then
+  systemctl start cocoon-wireguard.service
+fi
 systemctl start cocoon-router.service cocoon-worker-runner.service cocoon-$BACKEND.service

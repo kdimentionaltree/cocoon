@@ -21,7 +21,7 @@ mkdir $SRCDIR/cocoon/build-reprodebian || true
 # Install binaries to guest image
 mkdir -p "$DESTDIR/usr/bin"
 
-for binary in tee/cocoon/tdx/sgx-enclave/seal-client tee/cocoon/tdx/sgx-enclave/seal-server tee/gen-cert tee/router worker-runner client-runner proxy-runner key-manager-runner sync-time tee/cocoon-subst tee/health-monitor tee/health-client tee/sev-info; do
+for binary in tee/cocoon/tdx/sgx-enclave/seal-client tee/cocoon/tdx/sgx-enclave/seal-server tee/gen-cert tee/router worker-runner client-runner proxy-runner key-manager-runner sync-time tee/cocoon-subst tee/cocoon-wireguard tee/health-monitor tee/health-client tee/sev-info; do
   cp "$SRCDIR/cocoon/build-reprodebian/$binary" "$DESTDIR/usr/bin/"
 done
 
@@ -32,11 +32,11 @@ cp "$SRCDIR/cocoon/build-reprodebian/tee/cocoon/tdx/sgx-enclave/enclave.signed.s
 mkdir -p "$DESTDIR/usr/share/cocoon"
 cp "$SRCDIR/cocoon/build-reprodebian/tee/cocoon/tdx/sgx-enclave/mr_enclave.txt" "$DESTDIR/usr/share/cocoon/"
 
-for binary in cocoon-init{,-tdx,-sev,-common,-debug} cocoon-prepare-spec cocoon-render-config cocoon-render-ton-config cocoon-cert-refresh cocoon-sync-time gen-cert-synced; do
+for binary in cocoon-init{,-tdx,-sev,-common,-debug} cocoon-prepare-spec cocoon-render-config cocoon-render-ton-config cocoon-cert-refresh cocoon-sync-time gen-cert-synced cocoon-wireguard-prepare; do
   cp "$SRCDIR/cocoon-init/$binary" "$DESTDIR/usr/bin/$binary"
 done
-
 mkdir -p "$DESTDIR/lib/systemd/system"
+install -m 0644 "$SRCDIR/cocoon/scripts/wireguard/systemd/cocoon-wireguard.service" "$DESTDIR/lib/systemd/system/cocoon-wireguard.service"
 for service in cocoon-init.service cocoon-ready.target mnt-spec.mount spec.service cocoon-cert-refresh.service cocoon-cert-refresh.timer cocoon-health.service cocoon-sev-pki-update.{service,timer}; do
   cp "$SRCDIR/cocoon-init/$service" "$DESTDIR/lib/systemd/system/$service"
 done

@@ -128,7 +128,7 @@ std::string extension(X509 *certificate, const char *oid) {
 }
 
 Evidence verify_certificate(X509 *certificate, const Config &config, EvidenceProvider &provider,
-                            const Deadline &deadline) {
+                            const Deadline &deadline, std::string_view expected_image) {
   auto public_key = tls_key(certificate);
   for (int i = 0; i < X509_get_ext_count(certificate); ++i) {
     auto ext = X509_get_ext(certificate, i);
@@ -145,8 +145,9 @@ Evidence verify_certificate(X509 *certificate, const Config &config, EvidencePro
   require(extension(certificate, "1.3.6.1.4.1.12345.2") == public_key,
           "Certificate user claims do not match its TLS key");
   auto evidence = provider.verify(extension(certificate, "1.3.6.1.4.1.12345.1"), deadline);
-  check_evidence(evidence, digest(public_key, EVP_sha512()), evidence.image_hash_hex);
-  require(std::find(config.allowed_image_hashes_hex.begin(), config.allowed_image_hashes_hex.end(),
+  check_evidence(evidence, digest(public_key, EVP_sha512()), expected_image);
+  require(config.image_policy == ImagePolicy::SignedMembership ||
+              std::find(config.allowed_image_hashes_hex.begin(), config.allowed_image_hashes_hex.end(),
                     evidence.image_hash_hex) != config.allowed_image_hashes_hex.end(),
           "TLS certificate image is outside admission policy");
   return evidence;
@@ -389,7 +390,7 @@ std::string admit_connected_socket(int socket, bool server, const Config &config
               "Cannot hash peer certificate");
       std::string hash(reinterpret_cast<const char *>(fingerprint.data()), fingerprint.size());
       if (!peer_certificate_evidence || hash != verified_certificate) {
-        peer_certificate_evidence = verify_certificate(cert, config, provider, handshake_deadline);
+        peer_certificate_evidence = verify_certificate(cert, config, provider, handshake_deadline, remote_member.image_hash_hex);
         verified_certificate = hash;
       }
       return 1;
@@ -402,7 +403,7 @@ std::string admit_connected_socket(int socket, bool server, const Config &config
   SSL_CTX_set_max_cert_list(ctx, 65536);
   SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
   SSL_CTX_set_num_tickets(ctx, 0);
-  auto local_evidence = verify_certificate(SSL_CTX_get0_certificate(ctx), config, provider, deadline);
+  auto local_evidence = verify_certificate(SSL_CTX_get0_certificate(ctx), config, provider, deadline, local_member.image_hash_hex);
   require(local_evidence.image_hash_hex == local_member.image_hash_hex,
           "Local TLS image differs from signed membership");
   std::unique_ptr<SSL, decltype(&SSL_free)> ssl(SSL_new(ctx), SSL_free);

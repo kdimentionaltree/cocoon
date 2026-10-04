@@ -1145,6 +1145,17 @@ int main(int argc, char **argv) {
     cleanup_tests(fixture);
     auto old_quote = paired_session(fixture, true);
     check(!old_quote.empty(), "No fresh test quote generated");
+    auto pinned_a = fixture.a, pinned_b = fixture.b;
+    fixture.a.image_policy = fixture.b.image_policy = wg::ImagePolicy::SignedMembership;
+    fixture.a.allowed_image_hashes_hex.clear(); fixture.b.allowed_image_hashes_hex.clear();
+    paired_session(fixture, true);
+    paired_session(fixture, false, true);  // Authentic membership cannot make mismatched evidence valid.
+    auto wrong_image = fixture.membership;
+    wrong_image.members[1].image_hash_hex = std::string(64, 'b');
+    fixture.envelope = wg::sign_membership(wrong_image, fixture.signer);
+    paired_session(fixture, false);  // Certificate quote must match the exact signed image.
+    fixture.envelope = wg::sign_membership(fixture.membership, fixture.signer);
+    fixture.a = pinned_a; fixture.b = pinned_b;
     paired_session(fixture, false, false, false, old_quote);
     paired_session(fixture, false, true);
     paired_session(fixture, false, false, true);

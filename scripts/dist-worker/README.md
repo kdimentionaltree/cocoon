@@ -129,6 +129,12 @@ Example:
 ./scripts/cocoon-launch --instance 1 --gpu 0000:41:00.0 worker.conf &
 ```
 
+## Optional WireGuard overlay
+
+With an image containing the WireGuard service, add `wireguard_config = /path/to/worker-wireguard.json` to the worker configuration or pass `--wireguard-config FILE`. The launcher copies it into the measured spec and forwards encrypted UDP plus admission TCP with the normal instance offset. `backend = sglang` or `vllm` selects the measured engine service.
+
+Enrollment exports and approved guest measurements must be signed by the pinned operator authority. Deliver the grant to the prepared runtime path printed by the launcher; the workers wait for admission and overlay readiness before serving. Follow the [WireGuard deployment runbook](../wireguard/README.md) for configuration, signing, renewal and recovery. Distributed inference rank launch is separate from this integration.
+
 ## seal-server
 
 `seal-server` is required for production deployment. It runs on the host and provides secure key derivation for TDX guests.
@@ -199,4 +205,3 @@ For detailed monitoring, use `health-client`:
 ```
 
 Run `./health-client --help` for complete usage information. 
-

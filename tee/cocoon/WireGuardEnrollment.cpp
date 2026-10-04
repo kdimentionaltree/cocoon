@@ -297,18 +297,24 @@ Config parse_config(std::string_view input) {
   c.membership_signer_public_key_b64 = text(j, "membership_signer_public_key_b64");
   public_key(c.membership_signer_public_key_b64);
   const auto &policy = j.at("attestation");
-  fields(policy, {"type", "allowed_image_hashes_hex"});
   require(text(policy, "type") == "tdx", "Only real TDX admission is supported");
-  const auto &images = policy.at("allowed_image_hashes_hex");
-  require(images.is_array() && !images.empty() && images.size() <= max_members,
-          "Image allowlist must be nonempty and bounded");
-  std::set<std::string> distinct_images;
-  for (const auto &image : images) {
-    require(image.is_string(), "Image hash must be a string");
-    auto hash = image.get<std::string>();
-    hex_bytes(hash, 32);
-    require(distinct_images.insert(hash).second, "Duplicate image hash");
-    c.allowed_image_hashes_hex.push_back(hash);
+  if (policy.contains("image_policy")) {
+    fields(policy, {"type", "image_policy"});
+    require(text(policy, "image_policy") == "signed_membership", "Unsupported image authorization policy");
+    c.image_policy = ImagePolicy::SignedMembership;
+  } else {
+    fields(policy, {"type", "allowed_image_hashes_hex"});
+    const auto &images = policy.at("allowed_image_hashes_hex");
+    require(images.is_array() && !images.empty() && images.size() <= max_members,
+            "Image allowlist must be nonempty and bounded");
+    std::set<std::string> distinct_images;
+    for (const auto &image : images) {
+      require(image.is_string(), "Image hash must be a string");
+      auto hash = image.get<std::string>();
+      hex_bytes(hash, 32);
+      require(distinct_images.insert(hash).second, "Duplicate image hash");
+      c.allowed_image_hashes_hex.push_back(hash);
+    }
   }
   if (j.contains("mtu")) {
     c.mtu = static_cast<std::uint16_t>(number(j, "mtu", 1280, 1420));
@@ -504,7 +510,8 @@ Membership verify_membership(const Config &config, const Identity &identity, std
   require(m.members.size() == config.peers.size() + 1, "Membership does not match the configured group");
   bool found_local = false;
   for (const auto &member : m.members) {
-    require(std::find(config.allowed_image_hashes_hex.begin(), config.allowed_image_hashes_hex.end(),
+    require(config.image_policy == ImagePolicy::SignedMembership ||
+                std::find(config.allowed_image_hashes_hex.begin(), config.allowed_image_hashes_hex.end(),
                       member.image_hash_hex) != config.allowed_image_hashes_hex.end(),
             "Member image is not authorized by policy");
     if (member.node_id == config.node_id) {

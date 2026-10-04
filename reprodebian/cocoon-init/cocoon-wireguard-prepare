@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Opt-in guest integration. Authorization policy comes from the measured spec."""
+
+import copy
+import json
+import os
+from pathlib import Path
+import shlex
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+SPEC = Path('/spec')
+RENDERED = Path('/run/spec')
+STATE = Path('/run/cocoon-wireguard')
+UNITS = Path('/run/systemd/system')
+MEMBERSHIP = Path('/mnt/spec/runtime/cluster-membership.json')
+CONFIG_NAME = 'wireguard-config.json'
+ENDPOINT_FIELDS = ('endpoint_ipv4', 'endpoint_port', 'admission_endpoint_port')
+
+
+def run(arguments, **kwargs):
+    return subprocess.run(arguments, check=True, timeout=20, text=True, **kwargs)
+
+
+def read_file(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(fd, 'r') as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError(f'Expected a regular file: {path}')
+        value = stream.read(1024 * 1024 + 1)
+    if len(value) > 1024 * 1024:
+        raise ValueError(f'File exceeds limit: {path}')
+    return value
+
+
+def unique_fields(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f'Duplicate JSON field: {key}')
+        result[key] = value
+    return result
+
+
+def read_json(path):
+    return json.loads(read_file(path), object_pairs_hook=unique_fields)
+
+
+def write_file(path, content, mode=0o600):
+    if path.is_symlink():
+        raise ValueError(f'Refusing a symlink output: {path}')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.wireguard-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def policy(config):
+    result = copy.deepcopy(config)
+    for peer in result['peers']:
+        for field in ENDPOINT_FIELDS:
+            peer.pop(field)
+    return result
+
+
+def render_config():
+    measured = read_json(SPEC / CONFIG_NAME)
+    run(['/usr/bin/cocoon-render-config', CONFIG_NAME])
+    rendered = read_json(RENDERED / CONFIG_NAME)
+    if policy(measured) != policy(rendered):
+        raise ValueError('Runtime substitution changed measured WireGuard authorization policy')
+    # Quoted numeric placeholders are allowed only in unsigned reachability hints.
+    for peer in rendered['peers']:
+        for field in ENDPOINT_FIELDS[1:]:
+            value = peer[field]
+            if isinstance(value, str) and value.isascii() and value.isdecimal():
+                peer[field] = int(value)
+    write_file(RENDERED / CONFIG_NAME, json.dumps(rendered, indent=2) + '\n')
+    run(['/usr/bin/cocoon-wireguard', 'check-config', '--config', str(RENDERED / CONFIG_NAME)], stdout=subprocess.PIPE)
+    return rendered
+
+
+def checked_config():
+    config = read_json(RENDERED / CONFIG_NAME)
+    run(['/usr/bin/cocoon-wireguard', 'check-config', '--config', str(RENDERED / CONFIG_NAME)], stdout=subprocess.PIPE)
+    return config
+
+
+def require_tdx():
+    if 'cocoon_no_tee' in Path('/proc/cmdline').read_text().split() or not Path('/dev/tdx_guest').exists():
+        raise ValueError('WireGuard worker integration requires an actual TDX guest')
+
+
+def input_rules(config):
+    comment = ['-m', 'comment', '--comment', 'cocoon-wireguard:' + config['interface']]
+    return [
+        ['-p', 'udp', '--dport', str(config['listen_port']), *comment, '-j', 'ACCEPT'],
+        ['-p', 'tcp', '--dport', str(config['admission_port']), *comment, '-j', 'ACCEPT'],
+        ['-i', config['interface'], '-s', config['overlay_network'], '-d', config['overlay_ipv4'] + '/32',
+         *comment, '-j', 'ACCEPT'],
+    ]
+
+
+def firewall(config, remove=False):
+    for rule in input_rules(config):
+        result = subprocess.run(['/usr/sbin/iptables', '-w', '2', '-C', 'INPUT', *rule],
+                                check=False, timeout=5, text=True, capture_output=True)
+        if result.returncode not in (0, 1):
+            raise ValueError('Cannot inspect guest input firewall')
+        if remove and result.returncode == 0:
+            run(['/usr/sbin/iptables', '-w', '2', '-D', 'INPUT', *rule])
+        elif not remove and result.returncode == 1:
+            run(['/usr/sbin/iptables', '-w', '2', '-I', 'INPUT', *rule])
+
+
+def cleanup(config):
+    # This acquires the identity lock and closes the overlay before altering input permissions.
+    run(['/usr/bin/cocoon-wireguard', 'cleanup', '--config', str(RENDERED / CONFIG_NAME)])
+    firewall(config, remove=True)
+
+
+def prepare_network(config):
+    if config.get('timeouts', {}).get('peer_seconds', 30) < 5:
+        raise ValueError('Supervision requires peer_seconds >= 5')
+    if config['listen_port'] in (51822, 51823) or config['admission_port'] == 8000:
+        raise ValueError('Configured port conflicts with overlay control or inference')
+    run(['/usr/sbin/modprobe', 'wireguard'])
+    run(['/usr/sbin/modprobe', 'nf_tables'])
+    # The independent nftables drops must exist before the base INPUT policy permits wg traffic.
+    run(['/usr/bin/cocoon-wireguard', 'cleanup', '--config', str(RENDERED / CONFIG_NAME)])
+    firewall(config)
+    enrollment = run(['/usr/bin/cocoon-wireguard', 'enroll', '--config', str(RENDERED / CONFIG_NAME)],
+                     stdout=subprocess.PIPE).stdout
+    write_file(STATE / 'enrollment.json', enrollment)
+    print('WireGuard public enrollment (fresh hardware evidence is verified during admission):', flush=True)
+    print(enrollment, flush=True)
+
+
+def workload_start(backend, config):
+    lines = read_file(RENDERED / f'cocoon-{backend}.service').splitlines()
+    starts = [line[len('ExecStart='):] for line in lines if line.startswith('ExecStart=')]
+    if len(starts) != 1:
+        raise ValueError('Expected one inference ExecStart')
+    start = starts[0]
+    words = shlex.split(start)
+    if words[:2] not in (['docker', 'run'], ['/usr/bin/docker', 'run']):
+        raise ValueError('Expected a Docker inference service')
+    if any('NCCL_' in word or 'GLOO_SOCKET_IFNAME' in word for word in words):
+        raise ValueError('Inference service overrides overlay transport policy')
+    if ' -p 8000:8000 ' not in start or words.count('-p') != 1 or any(
+            word == '--net' or word.startswith(('--net=', '--network')) or word in ('-P', '--publish', '--publish-all')
+            or word.startswith('--publish=') for word in words):
+        raise ValueError('Expected the standard inference port mapping before enabling host networking')
+    start = start.replace(' -p 8000:8000 ', ' --network=host ', 1)
+    index = start.index(' run ') + len(' run ')
+    interface = config['interface']
+    transport = (f'-e NCCL_NET=Socket -e NCCL_IB_DISABLE=1 -e NCCL_SOCKET_IFNAME=={interface} '
+                 f'-e GLOO_SOCKET_IFNAME={interface} ')
+    return start[:index] + transport + start[index:]
+
+
+def configure(backend):
+    require_tdx()
+    if backend not in ('sglang', 'vllm'):
+        raise ValueError('Unsupported inference backend')
+    config = render_config()
+    start = workload_start(backend, config)
+    prepare_network(config)
+    dependency = ('[Unit]\nBindsTo=cocoon-wireguard.service\nAfter=cocoon-wireguard.service\n'
+                  '[Service]\nEnvironmentFile=/run/cocoon-wireguard/workload.env\n')
+    write_file(UNITS / f'cocoon-{backend}.service.d/20-wireguard.conf',
+               dependency + 'ExecStart=\nExecStart=' + start + '\n', 0o644)
+    write_file(UNITS / 'cocoon-worker-runner.service.d/20-wireguard.conf', dependency, 0o644)
+    startup = config.get('timeouts', {}).get('startup_seconds', 60)
+    write_file(UNITS / 'cocoon-wireguard.service.d/20-startup.conf',
+               f'[Service]\nTimeoutStartSec={2 * startup + 60}\n', 0o644)
+    write_file(STATE / 'workload.env',
+               f"COCOON_OVERLAY_INTERFACE={config['interface']}\nCOCOON_OVERLAY_IPV4={config['overlay_ipv4']}\n"
+               f"COCOON_NODE_RANK={config['node_rank']}\nCOCOON_OVERLAY_STATUS=/run/cocoon-wireguard/status.json\n")
+    run(['/usr/bin/systemctl', 'daemon-reload'])
+
+
+def wait_membership():
+    require_tdx()
+    config = checked_config()
+    prepare_network(config)
+    end = time.monotonic() + config.get('timeouts', {}).get('startup_seconds', 60)
+    print(f'Waiting for signed membership at {MEMBERSHIP}', flush=True)
+    while not MEMBERSHIP.exists():
+        if time.monotonic() >= end:
+            raise ValueError('Signed membership delivery deadline exceeded')
+        time.sleep(0.25)
+    run(['/usr/bin/cocoon-wireguard', 'verify-membership', '--config', str(RENDERED / CONFIG_NAME),
+         '--membership', str(MEMBERSHIP)], stdout=subprocess.PIPE)
+
+
+def main():
+    if os.geteuid() != 0:
+        raise ValueError('Guest WireGuard preparation requires root')
+    if len(sys.argv) == 3 and sys.argv[1] == 'configure':
+        configure(sys.argv[2])
+    elif len(sys.argv) == 2 and sys.argv[1] == 'wait':
+        wait_membership()
+    elif len(sys.argv) == 2 and sys.argv[1] == 'cleanup':
+        cleanup(checked_config())
+    else:
+        raise ValueError('Usage: cocoon-wireguard-prepare configure sglang|vllm | wait | cleanup')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        sys.exit(f'WireGuard guest preparation failed: {error}')

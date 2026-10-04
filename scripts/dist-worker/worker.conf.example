@@ -36,3 +36,12 @@ root_contract_address = EQCns7bYSp0igFvS1wpb5wsZjCKCV19MD5AVzI4EyxsnU73k
 
 # Optional: Persistent disk image path, 100GB (default: persistent-worker-{instance}.img)
 # persistent = persistent-worker-0.img
+
+# Optional: Measured inference backend (default: sglang)
+# backend = vllm
+
+# Optional: Attested WireGuard overlay (requires rebuilt guest image and real TDX)
+# See scripts/wireguard/README.md for enrollment and signed membership delivery.
+# wireguard_config = /path/to/worker-wireguard.json
+# wireguard_udp_port = 51820
+# wireguard_admission_port = 51821

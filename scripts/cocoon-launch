@@ -3,6 +3,7 @@
 import argparse
 import configparser
 import functools
+import json
 import os
 import re
 import shutil
@@ -91,6 +92,13 @@ class Config:
     # Worker-specific
     worker_coefficient: str = '1000'
     hf_token: str | None = None
+    backend: str | None = None
+    wireguard_config: str | None = None
+    wireguard_membership: str | None = None
+    wireguard_udp_port: int | None = None  # Host base ports, before instance offset
+    wireguard_admission_port: int | None = None
+    wireguard_listen_port: int | None = None  # Read from measured configuration
+    wireguard_guest_admission_port: int | None = None
 
     # TON configs
     ton_config_base: str | None = None
@@ -115,6 +123,7 @@ class Config:
     ssh_port: int | None = None
     vsock_cid: int | None = None
     tcp_ports: list[int] = field(default_factory=list)
+    udp_ports: list[int] = field(default_factory=list)
     no_tee: bool = False
     guestfwd_ip : str | None = None
     guestfwd_ports: list[int] = field(default_factory=list)
@@ -136,11 +145,12 @@ class Config:
             ('Common', ['root_contract_address', 'model', 'external_ip', 'external_worker_port',
                         'external_client_port', 'external_key_manager_port', 'node_wallet_key']),
             ('Runtime', ['test', 'fake_ton', 'no_cc', 'local_mode', 'instance']),
-            ('Worker', ['worker_coefficient', 'hf_token']),
+            ('Worker', ['worker_coefficient', 'hf_token', 'backend', 'wireguard_config',
+                        'wireguard_membership', 'wireguard_udp_port', 'wireguard_admission_port']),
             ('TON configs', ['ton_config_base', 'ton_config']),
             ('Paths', ['image_dir', 'build_dir', 'local_run_dir', 'model_tar_path', 'prepared_spec_dir']),
             ('Model', ['model_commit', 'model_verity_hash']),
-            ('QEMU/hardware', ['cpus', 'ram', 'gpu', 'persistent', 'ssh_port', 'vsock_cid', 'tcp_ports', 'no_tee', 'guestfwd_ip', 'guestfwd_ports']),
+            ('QEMU/hardware', ['cpus', 'ram', 'gpu', 'persistent', 'ssh_port', 'vsock_cid', 'tcp_ports', 'udp_ports', 'no_tee', 'guestfwd_ip', 'guestfwd_ports']),
             ('Extra', ['prepare_only', 'print_only', 'skip_build', 'just_build']),
         ]
 
@@ -304,6 +314,9 @@ def load_config_from_file(cli_args) -> Config:
     prepared_spec_dir = str(Path(tempfile.mkdtemp(prefix='cocoon-spec-')) / 'spec')
 
     if cli_args.local_all:
+        if any(get(name) is not None for name in ('wireguard_config', 'wireguard_membership',
+                                                 'wireguard_udp_port', 'wireguard_admission_port', 'backend')):
+            sys.exit('ERROR: WireGuard/backend guest options cannot be used with --local-all')
         return Config(node_type='local_all', spec_dir='', owner_address='', build_dir=build_dir,
                       prepared_spec_dir=prepared_spec_dir, local_run_dir='/tmp/run/', local_mode=True)
 
@@ -339,6 +352,11 @@ def load_config_from_file(cli_args) -> Config:
         # Worker-specific
         worker_coefficient=get('worker_coefficient', '1000'),
         hf_token=get('hf_token') or os.environ.get('HF_TOKEN'),
+        backend=get('backend'),
+        wireguard_config=get('wireguard_config'),
+        wireguard_membership=get('wireguard_membership'),
+        wireguard_udp_port=getint('wireguard_udp_port', None),
+        wireguard_admission_port=getint('wireguard_admission_port', None),
         # TON configs
         ton_config_base=get('ton_config_base',
                             str(script_dir / 'spec/mainnet-base-ton-config.json')) if not fake_ton else None,
@@ -388,6 +406,9 @@ def load_config_from_file(cli_args) -> Config:
             'TON_CONFIG_FILE': f'{cfg.local_run_dir}/global.config.json',
         })
 
+    cfg.tcp_ports.extend(getattr(cli_args, 'tcp', []))
+    cfg.udp_ports.extend(getattr(cli_args, 'udp', []))
+
     # Validate
     if not node_type:
         sys.exit('ERROR: type not set in config')
@@ -397,6 +418,11 @@ def load_config_from_file(cli_args) -> Config:
         sys.exit('ERROR: owner_address required')
     if node_type == 'worker' and not cfg.model:
         sys.exit('ERROR: model required for worker')
+    try:
+        configure_wireguard(cfg)
+        network_forwardings(cfg)  # Reject collisions/overflow before preparing a spec or building a model.
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        sys.exit(f'ERROR: {error}')
 
     # Parse --set args
     for entry in getattr(cli_args, 'set', []):
@@ -411,6 +437,75 @@ def load_config_from_file(cli_args) -> Config:
         cfg.extra_qemu_args = cfg.extra_qemu_args[1:]
 
     return cfg
+
+
+def configure_wireguard(cfg: Config):
+    if cfg.backend is not None and (cfg.node_type != 'worker' or cfg.backend not in ('sglang', 'vllm')):
+        raise ValueError('backend must be sglang or vllm on a worker')
+    source = Path(cfg.wireguard_config) if cfg.wireguard_config else Path(cfg.spec_dir) / 'wireguard-config.json'
+    if not source.exists():
+        if cfg.wireguard_config or any(value is not None for value in (
+                cfg.wireguard_membership, cfg.wireguard_udp_port, cfg.wireguard_admission_port)):
+            raise ValueError('WireGuard options require a measured wireguard-config.json')
+        return
+    if cfg.node_type != 'worker' or cfg.no_tee or cfg.local_mode:
+        raise ValueError('WireGuard integration requires a confidential worker guest')
+    if source.is_symlink() or not source.is_file() or source.stat().st_size > 1024 * 1024:
+        raise ValueError('WireGuard configuration must be a bounded regular file')
+
+    def unique_fields(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f'Duplicate WireGuard configuration field: {key}')
+            result[key] = value
+        return result
+
+    config = json.loads(source.read_text(), object_pairs_hook=unique_fields)
+    if config.get('format') != 'cocoon-wireguard-config-v1':
+        raise ValueError('Unsupported WireGuard configuration format')
+    for key in ('listen_port', 'admission_port'):
+        if type(config[key]) is not int or not 1024 <= config[key] <= 65535:
+            raise ValueError(f'WireGuard {key} must be a measured integer port')
+    if config['listen_port'] in (51822, 51823) or config['admission_port'] == 8000:
+        raise ValueError('WireGuard ports conflict with overlay control or inference')
+    cfg.wireguard_config = str(source.resolve())
+    cfg.wireguard_listen_port = config['listen_port']
+    cfg.wireguard_guest_admission_port = config['admission_port']
+    if cfg.wireguard_udp_port is None:
+        cfg.wireguard_udp_port = cfg.wireguard_listen_port
+    if cfg.wireguard_admission_port is None:
+        cfg.wireguard_admission_port = cfg.wireguard_guest_admission_port
+    if cfg.wireguard_membership:
+        membership = Path(cfg.wireguard_membership)
+        if membership.is_symlink() or not membership.is_file() or membership.stat().st_size > 1024 * 1024:
+            raise ValueError('Membership must be a bounded regular file')
+
+
+def network_forwardings(cfg: Config):
+    if cfg.instance < 0:
+        raise ValueError('instance must be nonnegative')
+    offset = cfg.instance * 10
+    mappings = []
+    if cfg.ssh_port is not None:
+        mappings.append(('tcp', cfg.ssh_port + offset, 22))
+    mappings.extend(('tcp', port + offset, port) for port in cfg.tcp_ports)
+    mappings.extend(('udp', port + offset, port) for port in cfg.udp_ports)
+    if cfg.wireguard_config:
+        mappings.extend([
+            ('udp', cfg.wireguard_udp_port + offset, cfg.wireguard_listen_port),
+            ('tcp', cfg.wireguard_admission_port + offset, cfg.wireguard_guest_admission_port),
+        ])
+    seen = set()
+    guest_ports = set()
+    for protocol, host, guest in mappings:
+        if not 1 <= host <= 65535 or not 1 <= guest <= 65535:
+            raise ValueError(f'{protocol} forwarding port is outside 1–65535 after instance offset')
+        if (protocol, host) in seen or (protocol, guest) in guest_ports:
+            raise ValueError(f'Duplicate {protocol} host/guest forwarding port')
+        seen.add((protocol, host))
+        guest_ports.add((protocol, guest))
+    return mappings
 
 
 def adjust_runner_services(spec_dir: str, fake_ton: bool) -> None:
@@ -508,6 +603,16 @@ def prepare_spec(cfg: Config):
 
     dest = cfg.prepared_spec_dir
     shutil.copytree(cfg.spec_dir, dest)
+    if cfg.wireguard_config:
+        shutil.copyfile(cfg.wireguard_config, Path(dest) / 'wireguard-config.json')
+        if cfg.wireguard_membership:
+            runtime = Path(dest) / 'runtime'
+            runtime.mkdir(exist_ok=True)
+            shutil.copyfile(cfg.wireguard_membership, runtime / 'cluster-membership.json')
+        print(f'WireGuard signed membership delivery: {dest}/runtime/cluster-membership.json')
+    if cfg.backend:
+        # This selection is part of the measured spec, not an unsigned runtime flag.
+        (Path(dest) / 'inference-backend').write_text(cfg.backend + '\n')
 
     # Apply TON configs
     if cfg.ton_config_base and Path(cfg.ton_config_base).exists():
@@ -687,10 +792,11 @@ def run_qemu(cfg: Config):
     vsock_cid = cfg.vsock_cid + (cfg.instance * 10)
 
     netdev = 'user,id=user.0'
-    if cfg.ssh_port:
-        netdev += f',hostfwd=tcp::{cfg.ssh_port + offset}-:22'
-    for guest_port in cfg.tcp_ports:
-        netdev += f',hostfwd=tcp::{guest_port + offset}-:{guest_port}'
+    for protocol, host_port, guest_port in network_forwardings(cfg):
+        netdev += f',hostfwd={protocol}::{host_port}-:{guest_port}'
+    if cfg.wireguard_config:
+        print(f'WireGuard endpoint: host UDP {cfg.wireguard_udp_port + offset} -> guest UDP {cfg.wireguard_listen_port}')
+        print(f'WireGuard admission: host TCP {cfg.wireguard_admission_port + offset} -> guest TCP {cfg.wireguard_guest_admission_port}')
     if cfg.guestfwd_ip and cfg.guestfwd_ports:
         for guestfwd_port in cfg.guestfwd_ports:
             netdev += f',guestfwd=tcp::{guestfwd_port}-tcp:{cfg.guestfwd_ip}:{guestfwd_port}'
@@ -954,6 +1060,11 @@ def parse_args():
     parser.add_argument('--root-contract-address', help='ROOT_CONTRACT_ADDRESS')
     parser.add_argument('--worker-coefficient', help='WORKER_COEFFICIENT')
     parser.add_argument('--hf-token', help='HF_TOKEN')
+    parser.add_argument('--backend', choices=['sglang', 'vllm'], help='Measured worker inference backend (default: sglang)')
+    parser.add_argument('--wireguard-config', help='Opt in with a measured WireGuard configuration JSON')
+    parser.add_argument('--wireguard-membership', help='Initial signed membership envelope; fresh enrollment still required')
+    parser.add_argument('--wireguard-udp-port', type=int, help='Host WireGuard UDP base port (instance offset is added)')
+    parser.add_argument('--wireguard-admission-port', type=int, help='Host admission TCP base port (instance offset is added)')
     parser.add_argument('--external-ip', help='EXTERNAL_IP')
     parser.add_argument('--external-worker-port', help='EXTERNAL_WORKER_PORT')
     parser.add_argument('--external-client-port', help='EXTERNAL_CLIENT_PORT')
@@ -987,6 +1098,7 @@ def parse_args():
     parser.add_argument('--ssh-port', type=int)
     parser.add_argument('--vsock-cid', type=int)
     parser.add_argument('--tcp', action='append', type=int, default=[])
+    parser.add_argument('--udp', action='append', type=int, default=[], help='Additional guest UDP port to forward with instance offset')
     parser.add_argument('--no-tee', action='store_true')
     parser.add_argument('--guestfwd-ip', help='IP address to forward quest connections')
     parser.add_argument('--image-dir', help='Image directory')

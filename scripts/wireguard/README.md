@@ -1,6 +1,6 @@
 # WireGuard service for confidential workers
 
-This implements steps 1–4 of the CVM overlay plan: strict configuration, protected local identities, signed membership, fresh mutually attested admission, transactional WireGuard setup, authenticated probes, and continuing lease/liveness supervision. `run` opens workload traffic only after the required group is admitted and healthy, renews admission, and withdraws access on failure. `setup` remains a foreground diagnostic with workload traffic blocked. Guest packaging and opt-in launcher integration are step 5; the unit files here are templates awaiting installation in the guest image.
+This implements steps 1–5 of the CVM overlay plan: strict configuration, protected identities, signed membership, fresh mutually attested admission, WireGuard setup, lease/liveness supervision, and opt-in guest/launcher integration. `run` opens workload traffic only after the required group is admitted and healthy, renews admission, and withdraws access on failure. `setup` remains a diagnostic with workload traffic blocked. The image build installs the daemon, tools, preparation helper and unit; measured worker configuration opts in. Distributed engine rank launch and real two-CVM acceptance remain separate work.
 
 **An enrollment export is not attestation evidence.** It carries `attestation_status: "not_collected"`. The signing helper authorizes the supplied identities; it does not verify their hardware evidence. `verify-membership` verifies the operator signature, allocation, validity, and local identity, not remote TDX quotes. Live peer admission must independently verify evidence before enabling workload traffic.
 
@@ -11,13 +11,15 @@ cmake --build build --target cocoon-wireguard test-wireguard test-wireguard-admi
 build/tee/test-wireguard
 build/tee/test-wireguard-admission
 build/tee/cocoon-wireguard --help
+python3 tee/test/wireguard-cli.py build/tee/cocoon-wireguard
+python3 tee/test/wireguard-integration.py build/tee/cocoon-wireguard
 ```
 
 The executable is a Linux target and uses the existing OpenSSL, JSON, and Cocoon dependencies. The local tests need ordinary loopback UDP and Unix datagram access but require no elevated networking privileges or TDX hardware. If installed, the `ip` helper is also exercised for read-only link inventory. The application network sandbox may block those operations. Actual `admit-peer`, `setup`, and `run` execution requires real TDX/DCAP support and confidential guests. `cleanup` performs no admission and works without that SDK.
 
 ## Trusted configuration
 
-Copy `worker-a.example.json` and `worker-b.example.json`, replacing the workload hash, signer public key, approved image hashes, and endpoint addresses. Placeholders intentionally fail validation. Use the actual mapped host ports for peer endpoints; local `listen_port` and `admission_port` name the guest's ports. For example, if a host maps UDP 51830 to guest UDP 51820, that host's peer entry uses `endpoint_port: 51830`.
+Copy `worker-a.example.json` and `worker-b.example.json`, replacing the workload hash, signer public key, and endpoint addresses. Placeholders intentionally fail validation. The examples use `image_policy: "signed_membership"`; independently approve each final guest measurement before signing its membership. Use the actual mapped host ports for peer endpoints; local `listen_port` and `admission_port` name the guest's ports. For example, if a host maps UDP 51830 to guest UDP 51820, that host's peer entry uses `endpoint_port: 51830`.
 
 The configuration, especially its signer key and authorization policy, must be protected by the measured guest image/spec or a separately verified trusted policy. Do not source the authority key or approved measurements from unsigned host runtime variables. A signature checked against an attacker-replaceable authority key establishes no authorization. Endpoint hints can change reachability but cannot replace signed member identities.
 
@@ -40,13 +42,29 @@ Both configurations must agree on cluster, workload digest, generation, and memb
 | `listen_port`, `admission_port` | Local guest UDP and TCP ports, each 1024–65535 |
 | `cert_base_name` | Absolute normalized certificate/key base path; existence is checked during admission, not configuration parsing |
 | `membership_signer_public_key_b64` | Pinned 32-byte Ed25519 public key, canonical padded standard base64 |
-| `attestation` | Exactly `type: "tdx"` and a nonempty bounded `allowed_image_hashes_hex` list; no permissive/fake platform modes |
+| `attestation` | `type: "tdx"` with either `image_policy: "signed_membership"` or a nonempty bounded `allowed_image_hashes_hex` list; no permissive/fake modes |
 | `peers` | All other nodes, with unique IDs/ranks/addresses and unique UDP/TCP endpoint pairs; endpoints are canonical non-loopback unicast IPv4 outside the overlay subnet |
 | `mtu` | Optional, 1280–1420; defaults to 1400; path-MTU checks follow during network setup |
 | `keepalive_seconds` | Optional, 0–120; defaults to 25; zero disables keepalive |
 | `timeouts` | Optional complete object; defaults: startup 60s, handshake 15s, lease 300s, renewal 60s, peer 30s |
 
 Handshake timeout cannot exceed startup timeout; renewal and peer deadlines must be shorter than the lease. `run` additionally requires `peer_seconds >= 5` for kernel permission timeout margins. The parser rejects duplicate/unknown fields, wrong JSON types, duplicate allocations, network/broadcast addresses, invalid encodings, oversized documents, and excessive nesting. Network startup checks interface ownership and actual underlay conflicts before modifying the device.
+
+For image authorization, choose exactly one form:
+
+```json
+{"type": "tdx", "image_policy": "signed_membership"}
+```
+
+or the original fixed policy:
+
+```json
+{"type": "tdx", "allowed_image_hashes_hex": ["64-lowercase-hexadecimal-characters"]}
+```
+
+Signed-membership mode delegates approval of each exact image hash to the measured Ed25519 operator key. It still requires a valid signed grant, DCAP verification, exact certificate/fresh-quote measurements and key/context binding. It does not trust self-reported images or unsigned policy changes. Unknown modes, mixed forms and empty fixed allowlists fail.
+
+Use signed-membership mode for measured worker specs. Cocoon includes the spec in RTMR3 and its image hash; embedding that final hash inside the same spec would create a circular dependency. The operator approves finalized measurements in signed membership, outside the measured files. Fixed allowlists remain available with a separately protected policy outside the measurement being approved.
 
 ## Generate guest identities
 
@@ -245,7 +263,7 @@ Wall time must be trustworthy when validating a grant, certificate and collatera
 
 `run` atomically writes `<state-dir>/status.json` (default `/run/cocoon-wireguard/status.json`) with exact mode 0600 in the private directory. It contains public peer keys/boot IDs/measurements, state, generation, membership digest, lease expiry, heartbeat age and rejection reasons. Private keys and heartbeat secrets are never persisted in status. Stdout emits status on phase/readiness changes; the file refreshes about once a second. **Status is a diagnostic snapshot, not an authorization token or proof that the daemon is still alive.**
 
-The [service template](systemd/cocoon-wireguard.service) uses `Type=notify`, a ten-second watchdog, cleanup before start and after stop, and the protected runtime directory. `READY=1` is sent only after required peers are healthy and kernel workload permissions are installed. Failure sends `STOPPING=1`, closes workload permissions, and removes the owned interface. systemd has no `READY=0` withdrawal protocol; service termination and a [consumer dependency](systemd/workload-dependency.conf.example) provide the stop contract. [systemd notifications](https://manpages.debian.org/trixie/libsystemd-dev/sd_notify.3.en.html).
+The [service template](systemd/cocoon-wireguard.service) uses `Type=notify`, a ten-second watchdog, preparation/cleanup before start and cleanup after stop, and the protected runtime directory. `READY=1` is sent only after required peers are healthy and kernel workload permissions are installed. Failure sends `STOPPING=1`, closes workload permissions, and removes the owned interface. systemd has no `READY=0` withdrawal protocol; service termination and a [consumer dependency](systemd/workload-dependency.conf.example) provide the stop contract. [systemd notifications](https://manpages.debian.org/trixie/libsystemd-dev/sd_notify.3.en.html).
 
 The template allows VM sockets for TDX quote generation and IPv6 for collateral retrieval, although overlay peers remain IPv4. Intel's quote library can use a host QGS through `AF_VSOCK`; blocking that family would prevent that attestation path. It places the DCAP cache under the protected runtime directory using `AZDCAP_CACHE`, which Intel's provider supports. [Intel quote transport](https://raw.githubusercontent.com/intel/confidential-computing.tee.dcap/main/QuoteGeneration/quote_wrapper/tdx_attest/tdx_attest.c), [Intel collateral cache configuration](https://github.com/intel/confidential-computing.tee.dcap/blob/main/QuoteGeneration/qcnl/linux/sgx_default_qcnl.conf).
 
@@ -257,7 +275,7 @@ BindsTo=cocoon-wireguard.service
 After=cocoon-wireguard.service
 ```
 
-`After` waits for notification readiness; `BindsTo` stops a consumer when the overlay service becomes unavailable. The template retries a failed overlay service with bounded start-rate limits. It does not automatically relaunch a stopped inference group: after the overlay becomes ready again, explicitly restart the bound consumers or have the future job supervisor restart all ranks together. Start/enable commands and image installation are deferred to step 5. If `startup_seconds` exceeds the unit's 125-second start timeout, adjust `TimeoutStartSec` to cover the startup and cleanup budget. Avoid adding `After=spec.service` when `/spec/init` synchronously starts the overlay, which would create an ordering cycle.
+`After` waits for notification readiness; `BindsTo` stops a consumer when the overlay service becomes unavailable. The template retries a failed overlay service with bounded start-rate limits. It does not automatically relaunch a stopped inference group: after the overlay becomes ready again, explicitly restart the bound consumers or have the future job supervisor restart all ranks together. Guest preparation generates a start-timeout drop-in allowing two startup windows plus 60 seconds for preparation: waiting for membership and then admitting the group. Avoid adding `After=spec.service` when `/spec/init` synchronously starts the overlay, which would create an ordering cycle.
 
 For crash recovery or a stopped diagnostic setup:
 
@@ -266,6 +284,77 @@ cocoon-wireguard cleanup --config /spec/wireguard-config.json
 ```
 
 Cleanup acquires the saved identity lock before changing a live service's permissions, verifies/reinstalls the exact closed guard, clears timed sets, deletes only the interface with the enrolled ownership alias, and records stopped/unready status. It is idempotent and does not generate a missing enrollment key. Foreign interface ownership or incompatible firewall state is rejected, requiring administrator reconciliation. The retained fallback guards stay in place. Run cleanup with the same protected configuration and state directory; preserve the same-boot identity while restarting.
+
+## Guest image and launcher integration (step 5)
+
+The reproducible image includes `wireguard-tools`, `nftables`, `kmod` and Python 3, installs `/usr/bin/cocoon-wireguard` plus `/usr/bin/cocoon-wireguard-prepare`, and installs the notification service without enabling it globally. The package's global `nftables.service` stays disabled; the overlay manages its individual table alongside the existing INPUT policy. Rebuild the guest image with this configuration; a complete new image has not been built or booted in this workspace.
+
+Before pruning the installed kernel, `mkosi.prepare` resolves the full `wireguard` and `nf_tables` dependency closures from its actual `modules.dep`/`modules.builtin`. It adds those files to the retained list, regenerates dependencies, checks the same closure afterward, and checks the version-specific load plan. Missing dependencies abort the build. Runtime preparation loads both modules and creates the nftables gate before opening input permissions. An older cache already containing a pruned kernel without WireGuard needs regeneration; it is rejected rather than producing an unusable image.
+
+Opt in by adding `wireguard-config.json` to a custom measured worker spec or supplying it to the launcher. A runtime `WIREGUARD_ENABLED` variable does not opt in or authorize anything.
+
+```bash
+scripts/cocoon-launch \
+  --wireguard-config worker-a.json \
+  --backend sglang \
+  --instance 0 \
+  worker.conf
+```
+
+`--backend vllm` selects the other existing engine template. The selection is recorded in `inference-backend` inside the measured prepared spec; the default remains SGLang. This selects an existing single-node engine service, not distributed ranks, tensor/pipeline parallelism, head/worker roles or a cluster inference endpoint.
+
+Equivalent optional INI fields:
+
+```ini
+[node]
+wireguard_config = /path/to/worker-a.json
+backend = sglang
+# Optional host base ports; instance*10 is added:
+wireguard_udp_port = 51820
+wireguard_admission_port = 51821
+```
+
+Default host ports come from the measured local UDP `listen_port` and TCP `admission_port`. Host mappings add `instance * 10`; guest ports stay unchanged. For instance 1 with guest ports 51820/51821, the host accepts UDP **51830** and admission TCP **51831**. Put these actual host ports and routable host addresses in other workers' endpoint hints. The launcher reports both mappings and the membership-delivery path. It rejects port overflow, duplicate mappings, negative instances, non-worker use and `--no-tee` with WireGuard. Optional `--udp PORT` follows the same general offset convention; these extra mappings do not create guest firewall permissions.
+
+Bootstrap:
+
+1. Pin the operator public key, workload/generation, allocation and image authorization mode in each worker configuration, then launch workers with those measured specs. This changes their final measurements; approve the finalized versions.
+2. Guest preparation generates/reuses its same-boot identity and exports public JSON to `/run/cocoon-wireguard/enrollment.json`, also printing it to the specialization journal/console. Collect exports and independently verify the intended guest measurements. Exports alone remain insufficient evidence.
+3. Sign one current membership containing the exact keys/boot identities, approved final measurements and allocation. Use the existing offline signing command; no signing key or enrollment authority runs inside a worker.
+4. Deliver the completed envelope atomically to **`<prepared-spec-dir>/runtime/cluster-membership.json`** on every host. The launcher prints this directory. The guest reads it live through the read-only raw spec mount at **`/mnt/spec/runtime/cluster-membership.json`**. It does not use the `/spec/runtime` copy taken during initial spec preparation, so post-enrollment grants and renewals are visible without changing measured files.
+5. The service waits for initial delivery for `startup_seconds`, verifies the saved local identity, then performs fresh mutual admission, probes and supervised activation. Inference and the worker runner start only after notification readiness. For renewal, atomically replace the file at that same host path on all ranks, following the coordinated-grant rules above.
+
+For a prepared, approved payload:
+
+```bash
+mkdir -p /actual/prepared/spec/runtime
+cocoon-wireguard sign-membership \
+  --payload membership.payload.json --signing-key membership-signer.pem \
+  --output /actual/prepared/spec/runtime/cluster-membership.next.json
+mv /actual/prepared/spec/runtime/cluster-membership.next.json \
+  /actual/prepared/spec/runtime/cluster-membership.json
+```
+
+`--wireguard-membership FILE` / `wireguard_membership = ...` can seed an already valid envelope into the prepared runtime directory; an old boot grant still fails after reboot. Updating the original source file supplied to that option does not update the prepared copy: renew at the path the launcher reports.
+
+Preparation renders endpoint IPv4/UDP/TCP hints only. It compares every other field with measured JSON, normalizes quoted numeric endpoint placeholders, then applies the daemon's strict parser. Runtime changes to the signer, image policy, workload, generation, allocation, required flags, local ports, timeouts or certificate path fail before network mutation. The rendered configuration is `/run/spec/wireguard-config.json`, mode 0600. Worker integration also reserves admission TCP 8000 for inference and rejects WireGuard UDP 51822/51823.
+
+Existing guest INPUT policy defaults to drop, so preparation adds exact marked rules for the configured outer UDP port, admission TCP port, and decrypted traffic on the owned overlay interface. The independent nftables gate is installed first and still enforces exact peers, workload leases and fallback drops; the base INPUT exception cannot override those drops. Post-stop cleanup removes only these marked INPUT rules after closing/removing the overlay and keeps the nftables guard. No global ruleset is flushed.
+
+The opted-in backend uses Docker host networking and forces NCCL Socket transport with InfiniBand disabled and NCCL/Gloo socket interfaces set to WireGuard. NCCL uses an exact interface match (`-e NCCL_SOCKET_IFNAME==wg0` for `wg0`), following [NVIDIA's interface selection syntax](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-socket-ifname). Both the engine and `cocoon-worker-runner.service` bind to overlay availability. `/run/cocoon-wireguard/workload.env` exposes `COCOON_OVERLAY_INTERFACE`, `COCOON_OVERLAY_IPV4`, `COCOON_NODE_RANK`, and `COCOON_OVERLAY_STATUS` to the bound service processes. The router remains independently available. Existing backend image/version choices are retained.
+
+If initial delivery misses a startup window or the group loses readiness, serving stays stopped. After supplying a current grant and restoring overlay readiness, explicitly start the bound engine and worker runner on all nodes together. For an otherwise completed bootstrap that timed out waiting for membership:
+
+```bash
+systemctl reset-failed cocoon-wireguard.service
+systemctl start cocoon-wireguard.service
+systemctl start cocoon-router.service cocoon-worker-runner.service cocoon-sglang.service
+```
+
+Use `cocoon-vllm.service` for that backend. To rerun specialization/configuration, stop the overlay and consumers first; preparation refuses to clean up an active identity. Automatic coherent rank restart remains future engine supervision work.
+
+Step-5 checks passed 445 enrollment assertions, 1,042 admission/supervision assertions, 34 CLI checks and 13 guest/launcher integration tests. Integration tests use real enrollment/signature operations and the actual install script with build/archive commands mocked; network/service mutations are mocked. Sanitizers and SDK syntax checks passed. Systemd verified temporary local-path unit copies and specialization ordering with the external hardware service stubbed. The exact pinned Debian 6.19.10 module package was also used to verify the retained dependency closure and load plan; no host module was loaded. Full mkosi image build/boot and real TDX/kernel/inference traffic acceptance are outstanding.
+
 
 ## Kernel integration test
 

@@ -43,7 +43,7 @@ def main():
             config = json.loads(template.read_text())
             config["membership_signer_public_key_b64"] = public_key
             config["workload_policy_sha256"] = "1" * 64
-            config["attestation"]["allowed_image_hashes_hex"] = ["a" * 64]
+            config["attestation"] = {"type": "tdx", "allowed_image_hashes_hex": ["a" * 64]}
             config_path = directory / f"worker-{node}.json"
             config_path.write_text(json.dumps(config))
             configurations.append(config_path)

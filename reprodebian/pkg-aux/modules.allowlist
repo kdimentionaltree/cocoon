@@ -1,3 +1,4 @@
+# WireGuard and nf_tables dependency closures are appended from the actual kernel by mkosi.prepare.
 ./build
 ./kernel/arch/x86/crypto/aesni-intel.ko.xz
 ./kernel/arch/x86/crypto/ghash-clmulni-intel.ko.xz

@@ -166,6 +166,13 @@ void configuration_tests() {
   malformed([](auto &j) { j["attestation"]["type"] = "fake_tee"; });
   malformed([](auto &j) { j["attestation"]["type"] = "sev"; });
   malformed([](auto &j) { j["attestation"]["allowed_image_hashes_hex"] = Json::array(); });
+  malformed([](auto &j) { j["attestation"] = {{"type", "tdx"}, {"image_policy", "any"}}; });
+  malformed([](auto &j) { j["attestation"]["image_policy"] = "signed_membership"; });
+  auto signed_policy = valid;
+  signed_policy["attestation"] = {{"type", "tdx"}, {"image_policy", "signed_membership"}};
+  auto delegated = wg::parse_config(signed_policy.dump());
+  check(delegated.image_policy == wg::ImagePolicy::SignedMembership && delegated.allowed_image_hashes_hex.empty(),
+        "Signed image policy was not explicit or retained a circular allowlist");
   malformed([](auto &j) { j["membership_signer_public_key_b64"] = base64(std::string(32, '\0')); });
   malformed([](auto &j) { j["cert_base_name"] = "/etc/../tee"; });
   malformed([](auto &j) { j["cert_base_name"] = "relative"; });
@@ -231,6 +238,14 @@ void membership_tests() {
   bad([](auto &v) { v.members[1].node_id = "unallocated-worker"; });
   bad([](auto &v) { v.members[1].overlay_ipv4 = "10.77.0.3"; });
   bad([](auto &v) { v.members[1].image_hash_hex = std::string(64, 'f'); });
+  auto delegated = c;
+  delegated.image_policy = wg::ImagePolicy::SignedMembership;
+  delegated.allowed_image_hashes_hex.clear();
+  auto approved = m; approved.members[1].image_hash_hex = std::string(64, 'f');
+  auto approval = wg::sign_membership(approved, signing_key());
+  check(wg::verify_membership(delegated, alice_identity(), approval, 2000).members[1].image_hash_hex == std::string(64, 'f'),
+        "Operator-approved images still required embedding their own final spec hash");
+  rejected([&] { wg::verify_membership(delegated, alice_identity(), wg::sign_membership(approved, signing_key(true)), 2000); });
   bad([](auto &v) { v.members[1].node_id = v.members[0].node_id; });
   bad([](auto &v) { v.members[1].node_rank = v.members[0].node_rank; });
   bad([](auto &v) { v.members[1].wireguard_public_key_b64 = v.members[0].wireguard_public_key_b64; });

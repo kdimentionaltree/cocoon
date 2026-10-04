@@ -14,7 +14,7 @@
   "membership_signer_public_key_b64": "REPLACE_WITH_MEASURED_ED25519_PUBLIC_KEY",
   "attestation": {
     "type": "tdx",
-    "allowed_image_hashes_hex": ["REPLACE_WITH_APPROVED_IMAGE_HASH_HEX"]
+    "image_policy": "signed_membership"
   },
   "mtu": 1400,
   "keepalive_seconds": 25,

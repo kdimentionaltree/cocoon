@@ -16,12 +16,24 @@ if [[ "$1" == "final" ]]; then
 
   KERNEL_VERSION="$(ls $BUILDROOT/lib/modules/ -rt | tail -1)"
   echo kernel: $KERNEL_VERSION
+  # Derive dependencies before pruning; crypto library paths differ between kernel releases.
+  WG_MODULES="$(mktemp)"
+  WG_ALLOWLIST="$(mktemp)"
+  trap 'rm -f "$WG_MODULES" "$WG_ALLOWLIST"' EXIT
+  python3 "$SRCDIR/pkg-aux/wireguard-modules.py" "$BUILDROOT/lib/modules/$KERNEL_VERSION" > "$WG_MODULES"
+  cat "$SRCDIR/pkg-aux/modules.allowlist" "$WG_MODULES" > "$WG_ALLOWLIST"
   if ! grep -qP '\ball_modules\b' <<<"$PROFILES"; then
-    rsync -a --files-from="$SRCDIR/pkg-aux/modules.allowlist" "$BUILDROOT/lib/modules/$KERNEL_VERSION" "$BUILDROOT/lib/modules/$KERNEL_VERSION.pruned"
+    rsync -a --files-from="$WG_ALLOWLIST" "$BUILDROOT/lib/modules/$KERNEL_VERSION" "$BUILDROOT/lib/modules/$KERNEL_VERSION.pruned"
     rm -r "$BUILDROOT/lib/modules/$KERNEL_VERSION"
     mv "$BUILDROOT/lib/modules/$KERNEL_VERSION.pruned" "$BUILDROOT/lib/modules/$KERNEL_VERSION"
     mkosi-chroot depmod "$KERNEL_VERSION"
   fi
+  WG_RETAINED="$(python3 "$SRCDIR/pkg-aux/wireguard-modules.py" "$BUILDROOT/lib/modules/$KERNEL_VERSION")"
+  test "$WG_RETAINED" = "$(cat "$WG_MODULES")"
+  mkosi-chroot modprobe --set-version "$KERNEL_VERSION" --show-depends --ignore-install wireguard
+  mkosi-chroot modprobe --set-version "$KERNEL_VERSION" --show-depends --ignore-install nf_tables
+  rm -f "$WG_MODULES" "$WG_ALLOWLIST"
+  trap - EXIT
 
   sed -i -E 's/\\"nvidia id: [^"]+\\"/\\"nvidia id: cocoon build\\"/' $BUILDROOT/usr/src/nvidia-595.58.03/utils.mk
   mkosi-chroot dkms build nvidia/595.58.03 -k $KERNEL_VERSION --force

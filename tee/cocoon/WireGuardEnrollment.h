@@ -31,6 +31,8 @@ struct Timeouts {
   std::uint32_t peer_seconds{30};
 };
 
+enum class ImagePolicy { PinnedHashes, SignedMembership };
+
 struct Config {
   std::string interface;
   std::string overlay_network;
@@ -45,6 +47,7 @@ struct Config {
   std::string cert_base_name;
   std::string membership_signer_public_key_b64;
   std::vector<std::string> allowed_image_hashes_hex;
+  ImagePolicy image_policy{ImagePolicy::PinnedHashes};
   std::uint16_t mtu{1400};
   std::uint16_t keepalive_seconds{25};
   Timeouts timeouts;
