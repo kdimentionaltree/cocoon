@@ -54,8 +54,8 @@ td::Status parse_list_of_hex(td::Slice list, std::vector<T> &hashes) {
 }
 
 // Create policies from configuration
-std::map<std::string, cocoon::RATLSPolicyRef, std::less<>> create_policies_from_config(td::actor::Scheduler *scheduler,
-                                                                                       const ProxyConfig &config, bool no_tee) {
+td::Result<std::map<std::string, cocoon::RATLSPolicyRef, std::less<>>> create_policies_from_config(
+    td::actor::Scheduler *scheduler, const ProxyConfig &config, bool no_tee) {
   std::map<std::string, cocoon::RATLSPolicyRef, std::less<>> policies;
 
   // Create shared attestation cache for all TDX policies
@@ -79,10 +79,10 @@ std::map<std::string, cocoon::RATLSPolicyRef, std::less<>> create_policies_from_
       ratls = cocoon::RATLSInterface::make(scheduler, true, config).move_as_ok();
     } else if (policy_config.type == "tee") {
       ratls = cocoon::RATLSInterface::add_cache(cocoon::RATLSInterface::make(scheduler, false, config).move_as_ok(),
-                                                std::move(attestation_cache))
+                                                attestation_cache)
                   .move_as_ok();
     } else {
-      LOG(WARNING) << "Unknown policy type: " << policy_config.type << ", using 'any'";
+      return td::Status::Error("Unknown attestation policy type");
     }
 
     // Create policy with full configuration
@@ -521,7 +521,12 @@ int main(int argc, char **argv) {
   td::actor::Scheduler sched{{config.threads}};
 
   // Create policies
-  auto policies = create_policies_from_config(&sched, config, args.no_tee);
+  auto r_policies = create_policies_from_config(&sched, config, args.no_tee);
+  if (r_policies.is_error()) {
+    LOG(ERROR) << r_policies.error();
+    return 1;
+  }
+  auto policies = r_policies.move_as_ok();
 
   // Load certificate
   cocoon::TeeCertAndKey cert_and_key;

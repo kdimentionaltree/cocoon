@@ -127,6 +127,45 @@ target_include_directories(test-cocoon SYSTEM PRIVATE $<BUILD_INTERFACE:${OPENSS
 add_executable(gen-cert EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/cocoon/gen-cert.cpp)
 target_link_libraries(gen-cert PRIVATE cocoon tdutils tdnet_ported tdactor)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_library(cocoon_wireguard_enrollment STATIC
+    cocoon/WireGuardEnrollment.cpp
+    cocoon/WireGuardIdentity.cpp)
+  target_link_libraries(cocoon_wireguard_enrollment PRIVATE
+    nlohmann_json::nlohmann_json ${OPENSSL_CRYPTO_LIBRARY} ${CMAKE_DL_LIBS})
+  target_include_directories(cocoon_wireguard_enrollment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cocoon)
+  target_include_directories(cocoon_wireguard_enrollment SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
+
+  add_library(cocoon_wireguard_admission STATIC
+    cocoon/WireGuardAdmission.cpp
+    cocoon/WireGuardEvidence.cpp)
+  target_link_libraries(cocoon_wireguard_admission PUBLIC cocoon_wireguard_enrollment PRIVATE
+    cocoon tdactor tdnet_ported ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY} nlohmann_json::nlohmann_json)
+  target_include_directories(cocoon_wireguard_admission SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
+  if(ATTESTATION_AVAILABLE)
+    target_include_directories(cocoon_wireguard_admission SYSTEM PRIVATE
+      ${SGX_DCAP_QVL_INCLUDE_DIR} ${TDX_ATTEST_INCLUDE_DIR})
+  endif()
+
+  add_executable(cocoon-wireguard EXCLUDE_FROM_ALL cocoon/wireguard.cpp)
+  target_link_libraries(cocoon-wireguard PRIVATE cocoon_wireguard_admission)
+  target_include_directories(cocoon-wireguard SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
+
+  add_executable(test-wireguard EXCLUDE_FROM_ALL test/wireguard.cpp)
+  target_link_libraries(test-wireguard PRIVATE
+    cocoon_wireguard_enrollment nlohmann_json::nlohmann_json ${OPENSSL_CRYPTO_LIBRARY})
+  target_include_directories(test-wireguard SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
+
+  add_executable(test-wireguard-admission EXCLUDE_FROM_ALL test/wireguard-admission.cpp)
+  target_link_libraries(test-wireguard-admission PRIVATE
+    cocoon_wireguard_admission cocoon tdactor tdnet_ported ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY}
+    nlohmann_json::nlohmann_json)
+  target_include_directories(test-wireguard-admission SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
+  if(ATTESTATION_AVAILABLE)
+    target_include_directories(test-wireguard-admission SYSTEM PRIVATE ${SGX_DCAP_QVL_INCLUDE_DIR} ${TDX_ATTEST_INCLUDE_DIR})
+  endif()
+endif()
+
 add_executable(router EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/cocoon/router.cpp)
 target_link_libraries(router PRIVATE cocoon tdutils tdnet_ported tdactor)
 

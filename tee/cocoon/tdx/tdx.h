@@ -155,6 +155,22 @@ struct Report {
   std::string raw_report;  ///< Raw binary report data
 };
 
+// Kept separate from serialized reports: existing image hashes and certificate ABI are unchanged.
+struct ParsedQuote {
+  TdxAttestationData attestation;
+  td::uint64 td_attributes{0};
+  bool has_service_td{false};
+};
+struct VerifiedQuote {
+  ParsedQuote parsed;
+  td::UInt384 collateral_root_hash;
+};
+
+td::Result<Quote> tdx_make_quote(const td::UInt512 &reportdata);
+// Structural parsing is not cryptographic verification.
+td::Result<ParsedQuote> tdx_parse_quote(const Quote &quote);
+td::Result<VerifiedQuote> tdx_verify_quote(const Quote &quote);
+
 td::Result<Report> tdx_make_report(const td::UInt512 &user_claims_hash);
 td::Result<std::pair<SgxAttestationData, td::UInt384>> sgx_validate_quote(const Quote &quote);
 td::Result<std::pair<TdxAttestationData, td::UInt384>> tdx_validate_quote(const Quote &quote);

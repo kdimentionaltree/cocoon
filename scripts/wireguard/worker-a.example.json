@@ -1,0 +1,39 @@
+{
+  "format": "cocoon-wireguard-config-v1",
+  "interface": "wg0",
+  "overlay_network": "10.77.0.0/24",
+  "cluster_id": "example-cluster",
+  "workload_policy_sha256": "REPLACE_WITH_SIGNED_WORKLOAD_POLICY_SHA256",
+  "generation": 1,
+  "node_id": "worker-a",
+  "node_rank": 0,
+  "overlay_ipv4": "10.77.0.1",
+  "listen_port": 51820,
+  "admission_port": 51821,
+  "cert_base_name": "/etc/tee/tee",
+  "membership_signer_public_key_b64": "REPLACE_WITH_MEASURED_ED25519_PUBLIC_KEY",
+  "attestation": {
+    "type": "tdx",
+    "allowed_image_hashes_hex": ["REPLACE_WITH_APPROVED_IMAGE_HASH_HEX"]
+  },
+  "mtu": 1400,
+  "keepalive_seconds": 25,
+  "timeouts": {
+    "startup_seconds": 60,
+    "handshake_seconds": 15,
+    "lease_seconds": 300,
+    "renewal_seconds": 60,
+    "peer_seconds": 30
+  },
+  "peers": [
+    {
+      "node_id": "worker-b",
+      "node_rank": 1,
+      "overlay_ipv4": "10.77.0.2",
+      "endpoint_ipv4": "198.51.100.20",
+      "endpoint_port": 51820,
+      "admission_endpoint_port": 51821,
+      "required": true
+    }
+  ]
+}

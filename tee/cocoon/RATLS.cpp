@@ -36,6 +36,9 @@ class DefaultPolicy : public RATLSPolicy {
   }
 
   td::Result<RATLSAttestationReport> validate(const tde2e_core::PublicKey &public_key) const override {
+    if (ratls_) {
+      return td::Status::Error("Attestation evidence is required by this policy");
+    }
     // This is the special case when no expected extensions are present by client side
     if (config_.tdx_config.allowed_image_hashes.empty() && config_.sev_config.allowed_image_hashes.empty()) {
       // Just treat at tdx attestation report
@@ -89,7 +92,7 @@ class DefaultPolicy : public RATLSPolicy {
   }
 
   td::Result<RATLSAttestationReport> validate(const tde2e_core::PublicKey &public_key,
-                                              const sev::RATLSExtensions &extensions) const {
+                                              const sev::RATLSExtensions &extensions) const override {
     if (!ratls_) {
       if (!config_.sev_config.allowed_image_hashes.empty()) {
         return td::Status::Error("Image hash verification required but policy has no RATLS interface");
@@ -183,6 +186,9 @@ td::Result<std::optional<std::string>> get_extension(X509 *cert, td::CSlice oid)
   int ext_pos = X509_get_ext_by_OBJ(cert, custom_oid.get(), -1);
   if (ext_pos < 0) {
     return std::nullopt;
+  }
+  if (X509_get_ext_by_OBJ(cert, custom_oid.get(), ext_pos) >= 0) {
+    return td::Status::Error("Duplicate attestation extension");
   }
   auto *ext = X509_get_ext(cert, ext_pos);
   CHECK(ext != nullptr);
@@ -591,6 +597,9 @@ td::Result<RATLSInterfaceRef> RATLSInterface::make(td::actor::Scheduler *schedul
 
 td::Result<RATLSInterfaceRef> RATLSInterface::add_cache(RATLSInterfaceRef ratls,
                                                         std::shared_ptr<cocoon::AttestationCache> cache) {
+  if (!ratls || !cache) {
+    return td::Status::Error("Attestation verifier and cache must both be present");
+  }
   return std::make_shared<CachedRATLSInterface>(std::move(ratls), std::move(cache));
 }
 

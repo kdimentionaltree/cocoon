@@ -1,0 +1,28 @@
+{
+  "format": "cocoon-wireguard-membership-v1",
+  "cluster_id": "example-cluster",
+  "workload_policy_sha256": "REPLACE_WITH_SIGNED_WORKLOAD_POLICY_SHA256",
+  "generation": 1,
+  "not_before": 0,
+  "expires_at": 300,
+  "members": [
+    {
+      "node_id": "worker-a",
+      "node_rank": 0,
+      "boot_id": "REPLACE_WITH_WORKER_A_EXPORTED_BOOT_ID",
+      "overlay_ipv4": "10.77.0.1",
+      "wireguard_public_key_b64": "REPLACE_WITH_WORKER_A_EXPORTED_PUBLIC_KEY",
+      "image_hash_hex": "REPLACE_WITH_WORKER_A_VERIFIED_IMAGE_HASH",
+      "tee_type": "tdx"
+    },
+    {
+      "node_id": "worker-b",
+      "node_rank": 1,
+      "boot_id": "REPLACE_WITH_WORKER_B_EXPORTED_BOOT_ID",
+      "overlay_ipv4": "10.77.0.2",
+      "wireguard_public_key_b64": "REPLACE_WITH_WORKER_B_EXPORTED_PUBLIC_KEY",
+      "image_hash_hex": "REPLACE_WITH_WORKER_B_VERIFIED_IMAGE_HASH",
+      "tee_type": "tdx"
+    }
+  ]
+}

@@ -27,9 +27,6 @@
 #include <optional>
 #include <unordered_map>
 
-// Constants
-static constexpr long SECONDS_PER_DAY = 86400L;
-
 // TODO: Replace OBJ_* calls with NID_* equivalents for better performance
 namespace tdx {
 using cocoon::cut;
@@ -322,6 +319,8 @@ td::CSlice to_str(tdx_attest_error_t result) {
   }
 }
 
+#endif  // TD_TDX_ATTESTATION
+
 // TEE (Trusted Execution Environment) type constants
 static constexpr td::uint32 TEE_TYPE_SGX = 0x00000000;
 static constexpr td::uint32 TEE_TYPE_TDX = 0x00000081;
@@ -439,6 +438,13 @@ td::Result<QuoteBody> tdx_quote_to_body(td::Slice quote) {
 
     case QUOTE_VERSION_5: {
       TRY_RESULT(body_header, cut<BodyHeader>(body_slice));
+      if (body_header.size > body_slice.size()) {
+        return td::Status::Error("Truncated v5 quote body");
+      }
+      if ((body_header.body_type == BODY_SGX_ENCLAVE_REPORT_TYPE && header.tee_type != TEE_TYPE_SGX) ||
+          (body_header.body_type != BODY_SGX_ENCLAVE_REPORT_TYPE && header.tee_type != TEE_TYPE_TDX)) {
+        return td::Status::Error("Quote platform and body type disagree");
+      }
       body_slice.truncate(body_header.size);
 
       // v5 body type and size
@@ -485,6 +491,51 @@ SgxAttestationData from_body(const SgxQuoteBody &body) {
   SgxAttestationData result{};
   result.mr_enclave = body.mr_enclave;
   result.reportdata = body.report_data;
+  return result;
+}
+
+td::Result<ParsedQuote> tdx_parse_quote(const Quote &quote) {
+  if (quote.raw_quote.size() > 32768) {
+    return td::Status::Error("TDX quote exceeds 32 KiB limit");
+  }
+  td::Slice input(quote.raw_quote);
+  TRY_RESULT(header, cut<QuoteHeader>(input));
+  if (header.tee_type != TEE_TYPE_TDX || header.attestation_key_type != 2) {
+    return td::Status::Error("Expected an ECDSA-P256 TDX quote");
+  }
+  size_t body_size = sizeof(TdxQuoteBody10);
+  td::uint16 body_type = BODY_TD_REPORT10_TYPE;
+  if (header.version == QUOTE_VERSION_5) {
+    TRY_RESULT(body_header, cut<BodyHeader>(input));
+    body_type = body_header.body_type;
+    body_size = body_header.size;
+    if (!((body_type == BODY_TD_REPORT10_TYPE && body_size == sizeof(TdxQuoteBody10)) ||
+          (body_type == BODY_TD_REPORT15_TYPE && body_size == sizeof(TdxQuoteBody15)))) {
+      return td::Status::Error("Unsupported TDX v5 body type or size");
+    }
+  } else if (header.version != QUOTE_VERSION_4) {
+    return td::Status::Error("Expected TDX quote version 4 or 5");
+  }
+  if (input.size() < body_size + sizeof(td::uint32)) {
+    return td::Status::Error("Truncated TDX quote body or signature length");
+  }
+  auto body = input.substr(0, body_size);
+  input.remove_prefix(body_size);
+  TRY_RESULT(signature_size, cut<td::uint32>(input));
+  if (signature_size == 0 || signature_size != input.size()) {
+    return td::Status::Error("Invalid TDX quote signature length");
+  }
+  TRY_RESULT(body10, to<TdxQuoteBody10>(body.substr(0, sizeof(TdxQuoteBody10))));
+  ParsedQuote result;
+  result.attestation = from_body(body10);
+  // Quote fields use little endian, independently of the host representation.
+  for (unsigned i = 0; i < 8; ++i) {
+    result.td_attributes |= static_cast<td::uint64>(body10.td_attributes[i]) << (8 * i);
+  }
+  if (body_type == BODY_TD_REPORT15_TYPE) {
+    TRY_RESULT(body15, to<TdxQuoteBody15>(body));
+    result.has_service_td = body15.mr_service_td != td::UInt384::zero();
+  }
   return result;
 }
 
@@ -577,6 +628,8 @@ td::Result<TdxAttestationData> parse_tdx_report(td::Slice report) {
   return result;
 }
 
+#if TD_TDX_ATTESTATION
+
 td::Result<Report> tdx_make_report(const td::UInt512 &user_claims_hash) {
   // Prepare report data structure
   tdx_report_data_t report_data;
@@ -616,14 +669,14 @@ td::Result<std::vector<uint8_t>> validate_quote(const Quote &quote) {
     return td::Status::Error(PSLICE() << "Failed to get suppemental data size from collateral" << to_str(status)
                                       << " (0x" << td::format::as_hex(status) << ")");
   }
-  if (data_size > (1 << 20)) {
+  if (data_size < sizeof(sgx_ql_qv_supplemental_t) || data_size > (1 << 20)) {
     return td::Status::Error(PSLICE() << "Supplemental data size is too large: " << data_size);
   }
   std::vector<uint8_t> supplemental_data(data_size);
   tee_supp_data_descriptor_t supplemental_data_descriptor = {
       .major_version = 0,
       .data_size = data_size,
-      .p_data = &supplemental_data[0],
+      .p_data = supplemental_data.data(),
   };
 
   // Verify the quote using Intel's quote verification library
@@ -659,28 +712,23 @@ td::Result<std::pair<SgxAttestationData, td::UInt384>> sgx_validate_quote(const 
   TRY_RESULT(quote_body, tdx_quote_to_body(quote.raw_quote));
   const SgxQuoteBody &sgx_quote_body = quote_body.get<const SgxQuoteBody &>();
   auto sgx_attestation_data = from_body(sgx_quote_body);
-  TRY_RESULT(supplemental, to<sgx_ql_qv_supplemental_t>(td::Slice(&supplemental_data[0], supplemental_data.size())))
+  TRY_RESULT(supplemental, to<sgx_ql_qv_supplemental_t>(td::Slice(supplemental_data.data(), supplemental_data.size())))
   td::UInt384 root_key_id = td::as<td::UInt384>(supplemental.root_key_id);
 
   return std::make_pair(sgx_attestation_data, root_key_id);
 }
 
-td::Result<std::pair<TdxAttestationData, td::UInt384>> tdx_validate_quote(const Quote &quote) {
+td::Result<VerifiedQuote> tdx_verify_quote(const Quote &quote) {
+  TRY_RESULT(parsed, tdx_parse_quote(quote));
   TRY_RESULT(supplemental_data, validate_quote(quote));
+  TRY_RESULT(supplemental, to<sgx_ql_qv_supplemental_t>(td::Slice(supplemental_data.data(), supplemental_data.size())));
+  auto root_key_id = td::as<td::UInt384>(supplemental.root_key_id);
+  return VerifiedQuote{std::move(parsed), root_key_id};
+}
 
-  LOG(INFO) << "Extracting data from quote (" << quote.raw_quote.size() << ")";
-  TRY_RESULT(quote_body, tdx_quote_to_body(quote.raw_quote));
-
-  TdxAttestationData tdx_attestation_data{};
-  quote_body.visit(
-      td::overloaded([&](const TdxQuoteBody10 &body) { tdx_attestation_data = from_body(body); },
-                     [&](const TdxQuoteBody15 &body) { tdx_attestation_data = from_body(body); },
-                     [&](const SgxQuoteBody &body) { LOG(FATAL) << "TDX report expected while SGX found"; }));
-
-  TRY_RESULT(supplemental, to<sgx_ql_qv_supplemental_t>(td::Slice(&supplemental_data[0], supplemental_data.size())))
-  td::UInt384 root_key_id = td::as<td::UInt384>(supplemental.root_key_id);
-
-  return std::make_pair(tdx_attestation_data, root_key_id);
+td::Result<std::pair<TdxAttestationData, td::UInt384>> tdx_validate_quote(const Quote &quote) {
+  TRY_RESULT(verified, tdx_verify_quote(quote));
+  return std::make_pair(verified.parsed.attestation, verified.collateral_root_hash);
 }
 
 td::Result<TdxAttestationData> tdx_parse_report(const Report &report) {
@@ -705,6 +753,10 @@ td::Result<TdxAttestationData> tdx_parse_report(const Report &report) {
 }
 #else
 
+td::Result<VerifiedQuote> tdx_verify_quote(const Quote &quote) {
+  return td::Status::Error("TDX is not supported on this platform");
+}
+
 td::Result<Report> tdx_make_report(const td::UInt512 &user_claims_hash) {
   return td::Status::Error("TDX is not supported on this platform");
 }
@@ -721,6 +773,25 @@ td::Result<TdxAttestationData> tdx_parse_report(const Report &report) {
   return td::Status::Error("TDX is not supported on this platform");
 }
 #endif
+
+td::Result<Quote> tdx_make_quote(const td::UInt512 &reportdata) {
+#if TD_TDX_ATTESTATION
+  tdx_report_data_t data{};
+  static_assert(sizeof(data.d) == 64);
+  std::memcpy(data.d, reportdata.as_slice().data(), sizeof(data.d));
+  tdx_uuid_t selected_key{};
+  uint8_t *buffer = nullptr;
+  uint32_t size = 0;
+  auto status = tdx_att_get_quote(&data, nullptr, 0, &selected_key, &buffer, &size, 0);
+  std::unique_ptr<uint8_t, decltype(&tdx_att_free_quote)> owner(buffer, tdx_att_free_quote);
+  if (status != TDX_ATTEST_SUCCESS || !buffer || size == 0 || size > 32768) {
+    return td::Status::Error("TDX quote generation failed or exceeded the size limit");
+  }
+  return Quote{td::Slice(buffer, size).str()};
+#else
+  return td::Status::Error("TDX is not supported on this platform");
+#endif
+}
 
 td::UInt256 image_hash(const TdxAttestationData &data) {
   TdxAttestationData tdx_copy = data;

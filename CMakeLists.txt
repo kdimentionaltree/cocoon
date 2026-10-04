@@ -385,6 +385,9 @@ add_custom_target(runners DEPENDS client-runner proxy-runner worker-runner key-m
 
 # Build everything needed for cocoon-launch
 set(COCOON_ALL_DEPS runners cocoon-subst router gen-cert)
+if(TARGET cocoon-wireguard)
+    list(APPEND COCOON_ALL_DEPS cocoon-wireguard)
+endif()
 # Add seal targets only if SGX is available
 if(TARGET seal-server)
     list(APPEND COCOON_ALL_DEPS seal-server seal-client)
