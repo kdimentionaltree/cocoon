@@ -52,6 +52,7 @@ struct Config {
   std::uint16_t keepalive_seconds{25};
   Timeouts timeouts;
   std::vector<Peer> peers;
+  bool fake_tee{false};
 };
 
 // Public enrollment material only. Attestation and key possession are checked in the admission step.
@@ -76,6 +77,7 @@ struct Membership {
   std::uint64_t not_before{};
   std::uint64_t expires_at{};
   std::vector<Member> members;
+  bool fake_tee{false};
 };
 
 // All parsers reject unknown/duplicate fields, noncanonical values, and oversized inputs.

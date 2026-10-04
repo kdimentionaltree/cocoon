@@ -26,7 +26,7 @@ td::Result<openssl_ptr<EVP_PKEY, EVP_PKEY_free>> make_pkey() {
                                OSSL_PARAM_construct_end()};
 
   OPENSSL_CHECK_OK(EVP_PKEY_CTX_set_params(ctx.get(), params), "Cannot set EVP_PKEY_CTX");
-  EVP_PKEY *pkey;
+  EVP_PKEY *pkey = nullptr;
   OPENSSL_CHECK_OK(EVP_PKEY_keygen(ctx.get(), &pkey), "Cannot generate EVP_PKEY");
 
   return pkey;

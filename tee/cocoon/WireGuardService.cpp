@@ -114,7 +114,7 @@ void ServiceNotifier::watchdog(Clock::time_point now) {
 
 void run_overlay(const Config &config, const std::string &state_dir, const std::string &membership_path,
                  std::function<bool()> cancelled, std::function<void(std::string_view)> report) {
-  require(admission_supported(), "This build has no real TDX/DCAP support; supervision is disabled");
+  require(admission_supported(config), "This build has no real TDX/DCAP support; supervision is disabled");
   require(config.timeouts.peer_seconds >= 5, "Supervision requires peer_seconds >= 5 for kernel timeout margins");
   RuntimeIdentity identity(config, state_dir);
   ServiceNotifier notifier;

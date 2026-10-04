@@ -21,6 +21,11 @@ CONFIG_NAME = 'wireguard-config.json'
 ENDPOINT_FIELDS = ('endpoint_ipv4', 'endpoint_port', 'admission_endpoint_port')
 
 
+def wireguard_command(command, config, *arguments):
+    flags = ['--no-tee'] if config['attestation']['type'] == 'fake_tee' else []
+    return ['/usr/bin/cocoon-wireguard', command, '--config', str(RENDERED / CONFIG_NAME), *flags, *arguments]
+
+
 def run(arguments, **kwargs):
     return subprocess.run(arguments, check=True, timeout=20, text=True, **kwargs)
 
@@ -87,18 +92,22 @@ def render_config():
             if isinstance(value, str) and value.isascii() and value.isdecimal():
                 peer[field] = int(value)
     write_file(RENDERED / CONFIG_NAME, json.dumps(rendered, indent=2) + '\n')
-    run(['/usr/bin/cocoon-wireguard', 'check-config', '--config', str(RENDERED / CONFIG_NAME)], stdout=subprocess.PIPE)
+    run(wireguard_command('check-config', rendered), stdout=subprocess.PIPE)
     return rendered
 
 
 def checked_config():
     config = read_json(RENDERED / CONFIG_NAME)
-    run(['/usr/bin/cocoon-wireguard', 'check-config', '--config', str(RENDERED / CONFIG_NAME)], stdout=subprocess.PIPE)
+    run(wireguard_command('check-config', config), stdout=subprocess.PIPE)
     return config
 
 
-def require_tdx():
-    if 'cocoon_no_tee' in Path('/proc/cmdline').read_text().split() or not Path('/dev/tdx_guest').exists():
+def require_guest(config):
+    no_tee = 'cocoon_no_tee' in Path('/proc/cmdline').read_text().split()
+    fake = config['attestation']['type'] == 'fake_tee'
+    if fake != no_tee:
+        raise ValueError('WireGuard attestation mode must match the guest --no-tee boot flag')
+    if not fake and not Path('/dev/tdx_guest').exists():
         raise ValueError('WireGuard worker integration requires an actual TDX guest')
 
 
@@ -126,7 +135,7 @@ def firewall(config, remove=False):
 
 def cleanup(config):
     # This acquires the identity lock and closes the overlay before altering input permissions.
-    run(['/usr/bin/cocoon-wireguard', 'cleanup', '--config', str(RENDERED / CONFIG_NAME)])
+    run(wireguard_command('cleanup', config))
     firewall(config, remove=True)
 
 
@@ -138,12 +147,13 @@ def prepare_network(config):
     run(['/usr/sbin/modprobe', 'wireguard'])
     run(['/usr/sbin/modprobe', 'nf_tables'])
     # The independent nftables drops must exist before the base INPUT policy permits wg traffic.
-    run(['/usr/bin/cocoon-wireguard', 'cleanup', '--config', str(RENDERED / CONFIG_NAME)])
+    run(wireguard_command('cleanup', config))
     firewall(config)
-    enrollment = run(['/usr/bin/cocoon-wireguard', 'enroll', '--config', str(RENDERED / CONFIG_NAME)],
+    enrollment = run(wireguard_command('enroll', config),
                      stdout=subprocess.PIPE).stdout
     write_file(STATE / 'enrollment.json', enrollment)
-    print('WireGuard public enrollment (fresh hardware evidence is verified during admission):', flush=True)
+    evidence = 'synthetic fake_tee debug evidence' if config['attestation']['type'] == 'fake_tee' else 'fresh hardware evidence'
+    print(f'WireGuard public enrollment ({evidence} is verified during admission):', flush=True)
     print(enrollment, flush=True)
 
 
@@ -166,15 +176,15 @@ def workload_start(backend, config):
     index = start.index(' run ') + len(' run ')
     interface = config['interface']
     transport = (f'-e NCCL_NET=Socket -e NCCL_IB_DISABLE=1 -e NCCL_SOCKET_IFNAME=={interface} '
-                 f'-e GLOO_SOCKET_IFNAME={interface} ')
+                 f'-e NCCL_SOCKET_FAMILY=AF_INET -e NCCL_OOB_NET_ENABLE=0 -e GLOO_SOCKET_IFNAME={interface} ')
     return start[:index] + transport + start[index:]
 
 
 def configure(backend):
-    require_tdx()
     if backend not in ('sglang', 'vllm'):
         raise ValueError('Unsupported inference backend')
     config = render_config()
+    require_guest(config)
     start = workload_start(backend, config)
     prepare_network(config)
     dependency = ('[Unit]\nBindsTo=cocoon-wireguard.service\nAfter=cocoon-wireguard.service\n'
@@ -184,7 +194,8 @@ def configure(backend):
     write_file(UNITS / 'cocoon-worker-runner.service.d/20-wireguard.conf', dependency, 0o644)
     startup = config.get('timeouts', {}).get('startup_seconds', 60)
     write_file(UNITS / 'cocoon-wireguard.service.d/20-startup.conf',
-               f'[Service]\nTimeoutStartSec={2 * startup + 60}\n', 0o644)
+               f'[Service]\nTimeoutStartSec={2 * startup + 60}\nExecStart=\nExecStart=' +
+               shlex.join(wireguard_command('run', config, '--membership', str(MEMBERSHIP))) + '\n', 0o644)
     write_file(STATE / 'workload.env',
                f"COCOON_OVERLAY_INTERFACE={config['interface']}\nCOCOON_OVERLAY_IPV4={config['overlay_ipv4']}\n"
                f"COCOON_NODE_RANK={config['node_rank']}\nCOCOON_OVERLAY_STATUS=/run/cocoon-wireguard/status.json\n")
@@ -192,8 +203,8 @@ def configure(backend):
 
 
 def wait_membership():
-    require_tdx()
     config = checked_config()
+    require_guest(config)
     prepare_network(config)
     end = time.monotonic() + config.get('timeouts', {}).get('startup_seconds', 60)
     print(f'Waiting for signed membership at {MEMBERSHIP}', flush=True)
@@ -201,8 +212,7 @@ def wait_membership():
         if time.monotonic() >= end:
             raise ValueError('Signed membership delivery deadline exceeded')
         time.sleep(0.25)
-    run(['/usr/bin/cocoon-wireguard', 'verify-membership', '--config', str(RENDERED / CONFIG_NAME),
-         '--membership', str(MEMBERSHIP)], stdout=subprocess.PIPE)
+    run(wireguard_command('verify-membership', config, '--membership', str(MEMBERSHIP)), stdout=subprocess.PIPE)
 
 
 def main():

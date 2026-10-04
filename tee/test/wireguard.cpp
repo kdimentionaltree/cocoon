@@ -163,7 +163,12 @@ void configuration_tests() {
   malformed([](auto &j) { j["peers"][0]["overlay_ipv4"] = "10.77.0.1"; });
   malformed([](auto &j) { j["peers"][0]["required"] = "yes"; });
   malformed([](auto &j) { j["attestation"]["type"] = "any"; });
-  malformed([](auto &j) { j["attestation"]["type"] = "fake_tee"; });
+  auto fake_config = valid;
+  fake_config["attestation"]["type"] = "fake_tee";
+  check(wg::parse_config(fake_config.dump()).fake_tee, "Explicit fake-TEE policy was rejected");
+  fake_config["peers"][0]["endpoint_ipv4"] = "127.0.0.1";
+  check(wg::parse_config(fake_config.dump()).peers[0].endpoint_ipv4 == "127.0.0.1",
+        "Fake mode cannot test admission on loopback");
   malformed([](auto &j) { j["attestation"]["type"] = "sev"; });
   malformed([](auto &j) { j["attestation"]["allowed_image_hashes_hex"] = Json::array(); });
   malformed([](auto &j) { j["attestation"] = {{"type", "tdx"}, {"image_policy", "any"}}; });
@@ -210,6 +215,25 @@ void membership_tests() {
   auto envelope = wg::sign_membership(m, signing_key());
   check(Json::parse(envelope).at("signer_public_key_b64") == signer_public, "Signer differs from RFC 8032 vector");
   check(wg::verify_membership(c, alice_identity(), envelope, 2000).members.size() == 2, "Valid signature rejected");
+  auto fake_config = c; fake_config.fake_tee = true;
+  auto fake_membership = m; fake_membership.fake_tee = true;
+  auto fake_envelope = wg::sign_membership(fake_membership, signing_key());
+  check(wg::decode_membership(wg::encode_membership(fake_membership)).fake_tee,
+        "Fake membership lost its signed mode");
+  check(wg::encode_membership(fake_membership) != encoded, "Fake membership shared the real signing domain");
+  check(wg::parse_membership_payload(wg::membership_payload_json(fake_membership)).fake_tee,
+        "Fake membership JSON lost its mode");
+  check(wg::verify_membership(fake_config, alice_identity(), fake_envelope, 2000).fake_tee,
+        "Explicit fake membership rejected");
+  rejected([&] { wg::verify_membership(c, alice_identity(), fake_envelope, 2000); });
+  rejected([&] { wg::verify_membership(fake_config, alice_identity(), envelope, 2000); });
+  auto mixed = Json::parse(wg::membership_payload_json(m));
+  mixed["members"][0]["tee_type"] = "fake_tee";
+  rejected([&] { wg::parse_membership_payload(mixed.dump()); });
+  check(wg::identity_context(c) != wg::identity_context(fake_config), "Debug reused the real identity context");
+  auto fake_offer = Json::parse(wg::enrollment_json(fake_config, alice_identity()));
+  check(fake_offer["requested_tee_type"] == "fake_tee" && fake_offer["attestation_status"] == "synthetic",
+        "Debug enrollment claimed hardware evidence");
   check(wg::verify_membership(c, alice_identity(), envelope, 1900).not_before == 1900,
         "Valid lower time boundary rejected");
   rejected([&] { wg::verify_membership(c, alice_identity(), envelope, 2100); });

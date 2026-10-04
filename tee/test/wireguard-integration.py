@@ -88,7 +88,7 @@ class IntegrationTests(unittest.TestCase):
         cfg.udp_ports = [51820]
         with self.assertRaises(ValueError): launch.network_forwardings(cfg)
 
-    def test_opt_in_and_no_tee_rejection(self):
+    def test_opt_in_and_guest_restrictions(self):
         self.configuration.unlink()
         cfg = launch.Config('worker', str(self.spec), 'owner', tcp_ports=[12000])
         launch.configure_wireguard(cfg)
@@ -96,9 +96,22 @@ class IntegrationTests(unittest.TestCase):
         cfg.wireguard_udp_port = 51820
         with self.assertRaises(ValueError): launch.configure_wireguard(cfg)
         self.configuration.write_text(json.dumps(config()))
-        for kind, no_tee in [('proxy', False), ('worker', True)]:
-            cfg = launch.Config(kind, str(self.spec), 'owner', no_tee=no_tee)
+        for kind, local in [('proxy', False), ('worker', True)]:
+            cfg = launch.Config(kind, str(self.spec), 'owner', local_mode=local)
             with self.assertRaises(ValueError): launch.configure_wireguard(cfg)
+
+    def test_no_tee_prepares_fake_policy_and_preserves_source(self):
+        cfg = self.launch_config(no_tee=True)
+        cfg.ton_config_base = None; cfg.ton_config = None; cfg.fake_ton = True
+        (self.spec / 'init').write_text('#!/bin/bash\nsystemctl start test.service\n')
+        with patch.object(cfg, 'get_runtime_vars', return_value={}), contextlib.redirect_stdout(io.StringIO()):
+            launch.prepare_spec(cfg)
+        prepared = json.loads((Path(cfg.prepared_spec_dir) / 'wireguard-config.json').read_text())
+        self.assertEqual(prepared['attestation']['type'], 'fake_tee')
+        self.assertEqual(json.loads(self.configuration.read_text()), config())
+        self.configuration.write_text(json.dumps(prepared))
+        with self.assertRaisesRegex(ValueError, '--no-tee'): self.launch_config()
+        self.launch_config(no_tee=True)
 
     def test_ini_and_measured_backend_preparation(self):
         ini = self.root / 'worker.ini'
@@ -131,7 +144,7 @@ class IntegrationTests(unittest.TestCase):
         for name, value in [('SPEC', self.spec), ('RENDERED', self.rendered), ('STATE', self.state),
                             ('UNITS', self.units), ('MEMBERSHIP', self.membership)]:
             patcher = patch.object(guest, name, value); patcher.start(); self.addCleanup(patcher.stop)
-        hardware = patch.object(guest, 'require_tdx'); hardware.start(); self.addCleanup(hardware.stop)
+        hardware = patch.object(guest, 'require_guest'); hardware.start(); self.addCleanup(hardware.stop)
 
         def fake_run(arguments, **kwargs):
             self.calls.append(arguments)
@@ -168,6 +181,8 @@ class IntegrationTests(unittest.TestCase):
             self.assertIn('BindsTo=cocoon-wireguard.service', text)
             self.assertIn('--network=host', text)
             self.assertIn('NCCL_SOCKET_IFNAME==wg0', text)
+            self.assertIn('NCCL_SOCKET_FAMILY=AF_INET', text)
+            self.assertIn('NCCL_OOB_NET_ENABLE=0', text)
             self.assertIn('NCCL_NET=Socket', text)
             self.assertNotIn('-p 8000:8000', text)
         self.assertEqual(len(self.rules), 3)
@@ -192,12 +207,36 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(result['peers'][0]['endpoint_port'], 51830)
         self.assertEqual(result['peers'][0]['endpoint_ipv4'], '198.51.100.25')
 
+    def test_guest_fake_mode_reaches_all_commands_and_daemon(self):
+        fake = config(); fake['attestation']['type'] = 'fake_tee'
+        self.configuration.write_text(json.dumps(fake))
+        self.guest_fixture()
+        with contextlib.redirect_stdout(io.StringIO()): guest.configure('vllm')
+        for args in self.calls:
+            if args[0] == '/usr/bin/cocoon-wireguard': self.assertIn('--no-tee', args)
+        dropin = (self.units / 'cocoon-wireguard.service.d/20-startup.conf').read_text()
+        self.assertIn('ExecStart=\nExecStart=/usr/bin/cocoon-wireguard run', dropin)
+        self.assertIn('--no-tee', dropin)
+        self.assertEqual(json.loads((self.state / 'enrollment.json').read_text())['attestation_status'], 'synthetic')
+        guest.cleanup(fake)
+        self.assertFalse(self.rules)
+
+    def test_guest_boot_mode_must_match_policy(self):
+        real = config(); fake = copy.deepcopy(real); fake['attestation']['type'] = 'fake_tee'
+        with patch.object(Path, 'read_text', return_value='quiet cocoon_no_tee'), patch.object(Path, 'exists', return_value=False):
+            guest.require_guest(fake)
+            with self.assertRaisesRegex(ValueError, 'boot flag'): guest.require_guest(real)
+        with patch.object(Path, 'read_text', return_value='quiet'), patch.object(Path, 'exists', return_value=False):
+            with self.assertRaisesRegex(ValueError, 'boot flag'): guest.require_guest(fake)
+            with self.assertRaisesRegex(ValueError, 'actual TDX'): guest.require_guest(real)
+
     def test_runtime_policy_substitution_rejected(self):
         self.guest_fixture()
         for field, new in [('membership_signer_public_key_b64', base64.b64encode(b'k' * 32).decode()),
                            ('workload_policy_sha256', '2' * 64), ('generation', 2), ('node_rank', 1),
                            ('overlay_ipv4', '10.77.0.3'), ('listen_port', 51830),
-                           ('attestation', {'type': 'tdx', 'image_policy': 'any'})]:
+                           ('attestation', {'type': 'tdx', 'image_policy': 'any'}),
+                           ('attestation', {'type': 'fake_tee', 'image_policy': 'signed_membership'})]:
             def substitute(value):
                 value[field] = new
                 return value
@@ -307,6 +346,8 @@ class IntegrationTests(unittest.TestCase):
         shutil.copytree(ROOT / 'reprodebian/cocoon-init', source / 'cocoon-init')
         template = cocoon / 'scripts/wireguard/systemd'; template.mkdir(parents=True)
         shutil.copy2(ROOT / 'scripts/wireguard/systemd/cocoon-wireguard.service', template)
+        shutil.copy2(ROOT / 'scripts/wireguard/acceptance.py', template.parent / 'acceptance.py')
+        shutil.copy2(ROOT / 'scripts/wireguard/collective.py', template.parent / 'collective.py')
         (source / 'pkg-cache').mkdir(); (source / 'pkg-aux').mkdir()
         (source / 'pkg-aux/fuse-archive-blockdev.patch').touch()
         fakebin = self.root / 'fakebin'; fakebin.mkdir()
@@ -323,6 +364,12 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn('cocoon-wireguard run', result.stdout)
         helper = destination / 'usr/bin/cocoon-wireguard-prepare'
         self.assertTrue(os.access(helper, os.X_OK))
+        acceptance = destination / 'usr/bin/cocoon-wireguard-acceptance'
+        self.assertTrue(os.access(acceptance, os.X_OK))
+        result = REAL_RUN([str(acceptance), '--help'], check=True, capture_output=True, text=True)
+        self.assertIn('exchange', result.stdout)
+        self.assertEqual((destination / 'usr/share/cocoon/wireguard-collective.py').read_text(),
+                         (ROOT / 'scripts/wireguard/collective.py').read_text())
         unit = destination / 'lib/systemd/system/cocoon-wireguard.service'
         self.assertEqual(unit.read_text(), (ROOT / 'scripts/wireguard/systemd/cocoon-wireguard.service').read_text())
         self.assertFalse((destination / 'etc/systemd/system/multi-user.target.wants/cocoon-wireguard.service').exists())

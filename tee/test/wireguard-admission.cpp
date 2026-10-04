@@ -5,6 +5,8 @@
 #include "tee/cocoon/ProxyConfig.h"
 #include "tee/cocoon/Tee.h"
 #include "tee/cocoon/tdx/tdx.h"
+#include "tee/cocoon/tdx/Tee.h"
+#include "tee/cocoon/sev/Tee.h"
 
 #include <algorithm>
 #include <array>
@@ -77,6 +79,7 @@ class FixtureEvidence final : public wg::EvidenceProvider {
   std::string replay;
   std::string generated;
   std::chrono::milliseconds delay{0};
+  std::unique_ptr<wg::EvidenceProvider> fake;
   std::string quote(std::string_view reportdata, const wg::Deadline &deadline) override {
     deadline.check();
     if (!replay.empty()) return replay;
@@ -84,11 +87,13 @@ class FixtureEvidence final : public wg::EvidenceProvider {
     while (wg::Deadline::Clock::now() < resume) deadline.wait(-1, 0);
     std::string data(reportdata);
     if (corrupt_report) data[0] ^= 1;
-    generated = fixture_quote(data, std::string(64, wrong_image ? 'b' : 'a'));
+    generated = fake ? fake->quote(data, deadline) : fixture_quote(data, std::string(64, wrong_image ? 'b' : 'a'));
+    if (fake && wrong_image) generated[0] ^= 1;
     return generated;
   }
   wg::Evidence verify(std::string_view quote, const wg::Deadline &deadline) override {
     deadline.check();
+    if (fake) return fake->verify(quote, deadline);
     if (quote.size() != 141 || quote.substr(0, 4) != "TEST") throw wg::Error("Not a test quote");
     wg::Evidence result{std::string(quote.substr(68, 64)), std::string(quote.substr(4, 64)), 0, quote[140] != 0};
     for (unsigned i = 132; i < 140; ++i) {
@@ -268,6 +273,7 @@ std::string paired_session(Fixture &fixture, bool success, bool corrupt = false,
     FixtureEvidence provider;
     bool admitted = false;
     try {
+      if (fixture.b.fake_tee) provider.fake = wg::evidence_provider(fixture.b);
       auto output = wg::admit_connected_socket(sockets[1], true, fixture.b, fixture.identity_b, fixture.envelope,
                                                 "a", provider,
                                                 wg::Deadline(wg::Deadline::Clock::now() + std::chrono::seconds(3)), server_setup);
@@ -278,6 +284,7 @@ std::string paired_session(Fixture &fixture, bool success, bool corrupt = false,
   }
   close(sockets[1]);
   FixtureEvidence provider;
+  if (fixture.a.fake_tee) provider.fake = wg::evidence_provider(fixture.a);
   provider.corrupt_report = corrupt; provider.wrong_image = wrong_image;
   provider.replay = std::move(replay);
   provider.delay = delay;
@@ -290,6 +297,8 @@ std::string paired_session(Fixture &fixture, bool success, bool corrupt = false,
     admitted = status.at("status") == "peer_admitted";
     check(status.at("peer_wireguard_public_key_b64") == fixture.identity_b.wireguard_public_key_b64 &&
               status.at("workload_ready") == false, "Admission exposed an incorrect peer or workload readiness");
+    check(status.at("attestation_type") == (fixture.a.fake_tee ? "fake_tee" : "tdx"),
+          "Admission omitted its evidence mode");
   } catch (const wg::Error &error) {
     if (success) std::cerr << "Unexpected admission failure: " << error.what() << '\n';
   }
@@ -299,6 +308,55 @@ std::string paired_session(Fixture &fixture, bool success, bool corrupt = false,
         "Test peer had an unexpected admission result");
   check(admitted == success, "Local peer had an unexpected admission result");
   return provider.generated;
+}
+
+void fake_tee_tests() {
+  for (unsigned combination = 0; combination < 3; ++combination) {
+    Fixture fixture;
+    fixture.a.fake_tee = fixture.b.fake_tee = fixture.membership.fake_tee = true;
+    fixture.a.image_policy = fixture.b.image_policy = wg::ImagePolicy::SignedMembership;
+    fixture.a.allowed_image_hashes_hex.clear(); fixture.b.allowed_image_hashes_hex.clear();
+    fixture.identity_a = wg::load_or_create_identity(fixture.a, fixture.directory.path + "/fake-a");
+    fixture.identity_b = wg::load_or_create_identity(fixture.b, fixture.directory.path + "/fake-b");
+    for (unsigned i = 0; i < 2; ++i) {
+      auto &config = i == 0 ? fixture.a : fixture.b;
+      const auto &identity = i == 0 ? fixture.identity_a : fixture.identity_b;
+      auto tee = (combination == 1 || (combination == 2 && i == 1))
+          ? sev::make_tee(true, {}).move_as_ok() : tdx::make_tee(true, {}).move_as_ok();
+      auto cert = cocoon::generate_cert_and_key(tee.get()).move_as_ok();
+      for (const auto &suffix : {"_cert.pem", "_key.pem"}) std::filesystem::remove(config.cert_base_name + suffix);
+      wg::write_public_file(config.cert_base_name + "_cert.pem", cert.cert_pem());
+      wg::write_public_file(config.cert_base_name + "_key.pem", cert.key_pem());
+      chmod((config.cert_base_name + "_key.pem").c_str(), 0600);
+      auto &member = fixture.membership.members[i];
+      member.boot_id = identity.boot_id; member.wireguard_public_key_b64 = identity.wireguard_public_key_b64;
+      member.image_hash_hex = td::hex_encode(tee->make_report(td::UInt512{}).move_as_ok().image_hash().as_slice());
+      auto provider = wg::evidence_provider(config);
+      auto deadline = wg::Deadline(wg::Deadline::Clock::now() + std::chrono::seconds(3));
+      auto quote = provider->quote(std::string(64, 'q'), deadline);
+      auto evidence = provider->verify(quote, deadline);
+      wg::check_evidence(evidence, std::string(64, 'q'), member.image_hash_hex);
+      rejected([&] { provider->verify(quote + "trailing", deadline); });
+      rejected([&] { provider->verify(std::string_view(quote).substr(1), deadline); });
+      rejected([&] { provider->quote("short", deadline); });
+      check(wg::admission_supported(config), "SDK-free fake admission unavailable");
+    }
+    fixture.envelope = wg::sign_membership(fixture.membership, fixture.signer);
+    auto quote = paired_session(fixture, true);
+    paired_session(fixture, false, true); // Fresh synthetic REPORTDATA still binds the challenge.
+    paired_session(fixture, false, false, true);
+    paired_session(fixture, false, false, false, quote);
+    paired_session(fixture, true, false, false, {}, {}, [&](const wg::AdmittedSession &session) {
+      auto now = wg::Deadline::Clock::now();
+      auto wall = static_cast<std::uint64_t>(std::time(nullptr));
+      wg::LeaseSupervisor supervisor(fixture.a, session.membership(), now, wall);
+      supervisor.authorize(session, now, wall);
+      check(Json::parse(supervisor.status("starting", false, now, wall))["attestation_type"] == "fake_tee",
+            "Supervisor claimed real evidence for fake admission");
+    });
+    auto real = fixture.a; real.fake_tee = false;
+    rejected([&] { wg::verify_membership(real, fixture.identity_a, fixture.envelope, std::time(nullptr)); });
+  }
 }
 
 void quote_parser_tests() {
@@ -461,6 +519,9 @@ void device_tests(Fixture &fixture) {
     auto previous = commands.mutations;
     device.stop(device_deadline());
     check(commands.mutations == previous, "Cleanup is not idempotent");
+    auto inventory = Json::parse(wg::inspect_guard(fixture.a, commands, device_deadline()));
+    check(inventory.at("nftables") == commands.firewall, "Read-only gate inspection changed inventory");
+    check(commands.mutations == previous, "Gate inspection mutated network state");
     // The exact retained firewall can be reused; a changed guard is never flushed or adopted.
     for (auto &object : commands.firewall) {
       object.begin().value()["handle"] = 42;
@@ -472,6 +533,8 @@ void device_tests(Fixture &fixture) {
         }), expressions.end());
       }
     }
+    wg::inspect_guard(fixture.a, commands, device_deadline());
+    check(commands.mutations == previous, "Normalized gate inspection mutated network state");
     device.start(identity, device_deadline());
     device.stop(device_deadline());
     // Reconstruct the exact previous closed gate; upgrade must remain a single transaction.
@@ -497,6 +560,9 @@ void device_tests(Fixture &fixture) {
     check(commands.links.size() == 1, "Failed gate withdrawal prevented owned interface removal");
     commands.fail_mutation = 0;
     commands.firewall.back()["rule"]["expr"] = Json::array({{{"accept", nullptr}}});
+    previous = commands.mutations;
+    rejected([&] { wg::inspect_guard(fixture.a, commands, device_deadline()); });
+    check(commands.mutations == previous, "Rejected gate inspection mutated network state");
     rejected([&] { device.start(identity, device_deadline()); });
     check(commands.links.size() == 1, "Changed firewall allowed interface creation");
     for (unsigned conflict = 0; conflict < 4; ++conflict) {
@@ -548,6 +614,10 @@ void device_tests(Fixture &fixture) {
           }
         }
         check(populated == 2, "Timed workload gate omitted peer/group permissions");
+        auto mutations = commands.mutations;
+        check(Json::parse(wg::inspect_guard(fixture.a, commands, device_deadline())).at("nftables") == commands.firewall,
+              "Gate inspection did not preserve live permissions");
+        check(commands.mutations == mutations, "Live gate inspection withdrew permissions");
         check(!device.update_workload({}, now + std::chrono::seconds(1), device_deadline()), "Nearly expired lease opened kernel gate");
         for (const auto &object : commands.firewall) if (object.contains("set")) {
           check(!object["set"].contains("elem"), "Withdrawal retained kernel workload permissions");
@@ -1135,7 +1205,7 @@ int main(int argc, char **argv) {
       network_integration(argv[2], argv[3]);
       return 0;
     }
-    worker_tests(); policy_tests(); quote_parser_tests();
+    worker_tests(); policy_tests(); quote_parser_tests(); fake_tee_tests();
     Fixture fixture;
     transcript_tests(fixture);
     device_tests(fixture);

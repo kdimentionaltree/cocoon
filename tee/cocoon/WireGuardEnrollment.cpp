@@ -19,6 +19,7 @@ using Key = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
 constexpr std::size_t max_json_size = 65536;
 constexpr std::size_t max_members = 64;
 constexpr char membership_domain[] = "cocoon/wg-membership/v1";
+constexpr char fake_membership_domain[] = "cocoon/wg-membership/fake-tee/v1";
 
 void require(bool ok, const std::string &message) {
   if (!ok) {
@@ -138,14 +139,15 @@ void public_key(std::string_view key) {
   require(raw != std::string(32, '\0'), "Public key must not be zero");
 }
 
-std::uint32_t ipv4(std::string_view value) {
+std::uint32_t ipv4(std::string_view value, bool allow_loopback = false) {
   in_addr address{};
   require(inet_pton(AF_INET, std::string(value).c_str(), &address) == 1, "Invalid IPv4 address");
   char canonical[INET_ADDRSTRLEN];
   require(inet_ntop(AF_INET, &address, canonical, sizeof(canonical)) && value == canonical,
           "Noncanonical IPv4 address");
   auto ip = ntohl(address.s_addr);
-  require((ip >> 24) != 0 && (ip >> 24) != 127 && (ip >> 24) < 224, "IPv4 address must be unicast and non-loopback");
+  require((ip >> 24) != 0 && (allow_loopback || (ip >> 24) != 127) && (ip >> 24) < 224,
+          "IPv4 address must be unicast and non-loopback outside fake-TEE mode");
   return ip;
 }
 
@@ -258,7 +260,7 @@ Json payload_json(const Membership &m) {
     members.push_back({{"node_id", member.node_id}, {"node_rank", member.node_rank},
                        {"boot_id", member.boot_id}, {"overlay_ipv4", member.overlay_ipv4},
                        {"wireguard_public_key_b64", member.wireguard_public_key_b64},
-                       {"image_hash_hex", member.image_hash_hex}, {"tee_type", "tdx"}});
+                       {"image_hash_hex", member.image_hash_hex}, {"tee_type", m.fake_tee ? "fake_tee" : "tdx"}});
   }
   return {{"format", "cocoon-wireguard-membership-v1"}, {"cluster_id", m.cluster_id},
           {"workload_policy_sha256", m.workload_policy_sha256}, {"generation", m.generation},
@@ -297,7 +299,9 @@ Config parse_config(std::string_view input) {
   c.membership_signer_public_key_b64 = text(j, "membership_signer_public_key_b64");
   public_key(c.membership_signer_public_key_b64);
   const auto &policy = j.at("attestation");
-  require(text(policy, "type") == "tdx", "Only real TDX admission is supported");
+  auto tee_type = text(policy, "type");
+  require(tee_type == "tdx" || tee_type == "fake_tee", "Unsupported attestation type");
+  c.fake_tee = tee_type == "fake_tee";
   if (policy.contains("image_policy")) {
     fields(policy, {"type", "image_policy"});
     require(text(policy, "image_policy") == "signed_membership", "Unsupported image authorization policy");
@@ -350,7 +354,7 @@ Config parse_config(std::string_view input) {
     peer.overlay_ipv4 = text(p, "overlay_ipv4");
     subnet.host(ipv4(peer.overlay_ipv4));
     peer.endpoint_ipv4 = text(p, "endpoint_ipv4");
-    require(!subnet.contains(ipv4(peer.endpoint_ipv4)), "Underlay endpoint overlaps the overlay route");
+    require(!subnet.contains(ipv4(peer.endpoint_ipv4, c.fake_tee)), "Underlay endpoint overlaps the overlay route");
     peer.endpoint_port = static_cast<std::uint16_t>(number(p, "endpoint_port", 1024, 65535));
     peer.admission_endpoint_port = static_cast<std::uint16_t>(number(p, "admission_endpoint_port", 1024, 65535));
     if (p.contains("required")) {
@@ -385,7 +389,10 @@ Membership parse_membership_payload(std::string_view input) {
   for (const auto &member : members) {
     fields(member, {"node_id", "node_rank", "boot_id", "overlay_ipv4", "wireguard_public_key_b64",
                     "image_hash_hex", "tee_type"});
-    require(text(member, "tee_type") == "tdx", "Only TDX members are supported");
+    auto tee_type = text(member, "tee_type");
+    require(tee_type == "tdx" || tee_type == "fake_tee", "Unsupported member attestation type");
+    if (m.members.empty()) m.fake_tee = tee_type == "fake_tee";
+    require(m.fake_tee == (tee_type == "fake_tee"), "Mixed real and fake TEE membership is forbidden");
     m.members.push_back({text(member, "node_id"),
                          static_cast<std::uint16_t>(number(member, "node_rank", 0, max_members - 1)),
                          text(member, "boot_id"), text(member, "overlay_ipv4"),
@@ -400,7 +407,8 @@ std::string encode_membership(const Membership &membership) {
   validate_membership(membership);
   auto members = membership.members;
   std::sort(members.begin(), members.end(), [](const auto &a, const auto &b) { return a.node_id < b.node_id; });
-  std::string out(membership_domain, sizeof(membership_domain));
+  std::string out = membership.fake_tee ? std::string(fake_membership_domain, sizeof(fake_membership_domain))
+                                      : std::string(membership_domain, sizeof(membership_domain));
   sized_text(out, membership.cluster_id);
   out += hex_bytes(membership.workload_policy_sha256, 32);
   integer(out, membership.generation, 8);
@@ -421,9 +429,11 @@ std::string encode_membership(const Membership &membership) {
 Membership decode_membership(std::string_view payload) {
   require(payload.size() <= max_json_size, "Membership payload is too large");
   Decoder d{payload};
-  require(d.take(sizeof(membership_domain)) == std::string_view(membership_domain, sizeof(membership_domain)),
-          "Unsupported membership payload domain");
   Membership m;
+  m.fake_tee = payload.starts_with(std::string_view(fake_membership_domain, sizeof(fake_membership_domain)));
+  auto domain = m.fake_tee ? std::string_view(fake_membership_domain, sizeof(fake_membership_domain))
+                          : std::string_view(membership_domain, sizeof(membership_domain));
+  require(d.take(domain.size()) == domain, "Unsupported membership payload domain");
   m.cluster_id = d.text();
   m.workload_policy_sha256 = to_hex(d.take(32));
   m.generation = d.integer(8);
@@ -502,6 +512,7 @@ Membership verify_membership(const Config &config, const Identity &identity, std
                           reinterpret_cast<const unsigned char *>(encoded.data()), encoded.size()) == 1,
           "Invalid membership signature");
   auto m = decode_membership(encoded);
+  require(m.fake_tee == config.fake_tee, "Membership attestation mode does not match configuration");
   require(m.cluster_id == config.cluster_id && m.workload_policy_sha256 == config.workload_policy_sha256 &&
               m.generation == config.generation,
           "Membership cluster, workload, or generation does not match configuration");
@@ -540,6 +551,8 @@ std::string identity_context(const Config &c) {
   integer(out, ipv4(c.overlay_ipv4), 4);
   out += hex_bytes(c.workload_policy_sha256, 32);
   out += unbase64(c.membership_signer_public_key_b64, 32);
+  // Preserve real v1 identities, but never reuse them in the explicitly separate debug mode.
+  if (c.fake_tee) out += "fake_tee";
   return out;
 }
 
@@ -550,7 +563,8 @@ std::string enrollment_json(const Config &c, const Identity &identity) {
               {"workload_policy_sha256", c.workload_policy_sha256}, {"generation", c.generation},
               {"node_id", c.node_id}, {"node_rank", c.node_rank}, {"boot_id", identity.boot_id},
               {"overlay_ipv4", c.overlay_ipv4}, {"wireguard_public_key_b64", identity.wireguard_public_key_b64},
-              {"requested_tee_type", "tdx"}, {"attestation_status", "not_collected"}}
+              {"requested_tee_type", c.fake_tee ? "fake_tee" : "tdx"},
+              {"attestation_status", c.fake_tee ? "synthetic" : "not_collected"}}
              .dump(2) + "\n";
 }
 

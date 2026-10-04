@@ -24,13 +24,13 @@ class Deadline {
 };
 
 struct Evidence {
-  std::string reportdata;  // Exactly 64 raw bytes, verified by DCAP.
+  std::string reportdata;  // Exactly 64 raw bytes; hardware verified only in real TDX mode.
   std::string image_hash_hex;
   std::uint64_t td_attributes{};
   bool has_service_td{};
 };
 
-// Dependency injection is for isolated tests. The CLI always selects the real TDX provider.
+// Production selects real TDX; explicit --no-tee configurations select synthetic evidence.
 class EvidenceProvider {
  public:
   virtual ~EvidenceProvider() = default;
@@ -39,7 +39,9 @@ class EvidenceProvider {
 };
 
 bool admission_supported();
+bool admission_supported(const Config &config);
 std::unique_ptr<EvidenceProvider> real_evidence_provider();
+std::unique_ptr<EvidenceProvider> evidence_provider(const Config &config);
 int evidence_worker_main(std::string_view operation);
 // Runs only this executable's fixed internal evidence operations; kills and reaps on timeout/cancellation.
 std::string run_evidence_worker(std::string_view operation, std::string_view input, const Deadline &deadline);

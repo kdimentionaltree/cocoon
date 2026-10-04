@@ -54,6 +54,8 @@ class WireGuardDevice {
 };
 
 void install_closed_guard(const Config &config, NetworkCommands &commands, const Deadline &deadline);
+// Read-only diagnostic: validate the exact static gate and return its live timed-set inventory.
+std::string inspect_guard(const Config &config, NetworkCommands &commands, const Deadline &deadline);
 void cleanup_overlay(const Config &config, const std::string &state_dir, NetworkCommands &commands,
                      const Deadline &deadline);
 

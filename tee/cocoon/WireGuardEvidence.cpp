@@ -1,6 +1,9 @@
 #include "WireGuardAdmission.h"
 
 #include "tee/cocoon/tdx/tdx.h"
+#include "tee/cocoon/tdx/RATLS.h"
+#include "tee/cocoon/sev/ABI.h"
+#include "tee/cocoon/sev/RATLS.h"
 #include "td/utils/as.h"
 #include "td/utils/misc.h"
 
@@ -9,6 +12,7 @@
 #include <csignal>
 #include <cstring>
 #include <iostream>
+#include <openssl/pem.h>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -118,6 +122,56 @@ class RealEvidence final : public EvidenceProvider {
   }
 };
 
+// Matches gen-cert --tee fake_tee on Intel and AMD. These reports are forgeable;
+// only a separately signed fake membership and explicit debug configuration may use them.
+class FakeEvidence final : public EvidenceProvider {
+ public:
+  explicit FakeEvidence(const Config &config) {
+    auto pem = read_public_file(config.cert_base_name + "_cert.pem");
+    std::unique_ptr<BIO, decltype(&BIO_free)> bio(BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size())), BIO_free);
+    std::unique_ptr<X509, decltype(&X509_free)> cert(bio ? PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr) : nullptr,
+                                                  X509_free);
+    if (!cert) throw Error("Cannot read fake-TEE certificate");
+    std::unique_ptr<ASN1_OBJECT, decltype(&ASN1_OBJECT_free)> oid(OBJ_txt2obj("1.3.6.1.4.1.12345.101", 1), ASN1_OBJECT_free);
+    sev_ = X509_get_ext_by_OBJ(cert.get(), oid.get(), -1) >= 0;
+  }
+  std::string quote(std::string_view reportdata, const Deadline &deadline) override {
+    deadline.check();
+    if (reportdata.size() != 64) throw Error("Invalid fake REPORTDATA size");
+    if (sev_) {
+      sev::AttestationReport report{};
+      std::memcpy(report.report_data.raw, reportdata.data(), reportdata.size());
+      return {reinterpret_cast<const char *>(&report), sizeof(report)};
+    }
+    tdx::RATLSAttestationReport report{};
+    std::memcpy(report.reportdata.raw, reportdata.data(), reportdata.size());
+    return td::serialize(report);
+  }
+  Evidence verify(std::string_view quote, const Deadline &deadline) override {
+    deadline.check();
+    if (quote.size() == sizeof(sev::AttestationReport)) {
+      sev::AttestationReport report{};
+      std::memcpy(&report, quote.data(), sizeof(report));
+      sev::AttestationReport expected{};
+      expected.report_data = report.report_data;
+      if (std::memcmp(&report, &expected, sizeof(report)) != 0) throw Error("Not a synthetic SEV report");
+      sev::RATLSAttestationReport fake{};
+      fake.reportdata = report.report_data;
+      return {report.report_data.as_slice().str(), td::hex_encode(sev::image_hash(fake).as_slice()), 0, false};
+    }
+    // Exact size and round-trip check reject truncation, trailing bytes and all nonzero measurements.
+    tdx::RATLSAttestationReport report{};
+    auto parsed = td::unserialize(report, td::Slice(quote.data(), quote.size()));
+    if (parsed.is_error()) throw Error("Invalid synthetic TDX report");
+    tdx::RATLSAttestationReport expected{};
+    expected.reportdata = report.reportdata;
+    if (td::serialize(expected) != quote) throw Error("Not a synthetic TDX report");
+    return {report.reportdata.as_slice().str(), td::hex_encode(tdx::image_hash(report).as_slice()), 0, false};
+  }
+ private:
+  bool sev_{};
+};
+
 }  // namespace
 
 std::string run_evidence_worker(std::string_view operation, std::string_view input, const Deadline &deadline) {
@@ -133,6 +187,15 @@ bool admission_supported() {
 #else
   return false;
 #endif
+}
+
+bool admission_supported(const Config &config) {
+  return config.fake_tee || admission_supported();
+}
+
+std::unique_ptr<EvidenceProvider> evidence_provider(const Config &config) {
+  if (config.fake_tee) return std::make_unique<FakeEvidence>(config);
+  return real_evidence_provider();
 }
 
 std::unique_ptr<EvidenceProvider> real_evidence_provider() {

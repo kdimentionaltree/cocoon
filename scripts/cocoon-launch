@@ -448,8 +448,8 @@ def configure_wireguard(cfg: Config):
                 cfg.wireguard_membership, cfg.wireguard_udp_port, cfg.wireguard_admission_port)):
             raise ValueError('WireGuard options require a measured wireguard-config.json')
         return
-    if cfg.node_type != 'worker' or cfg.no_tee or cfg.local_mode:
-        raise ValueError('WireGuard integration requires a confidential worker guest')
+    if cfg.node_type != 'worker' or cfg.local_mode:
+        raise ValueError('WireGuard integration requires a worker guest')
     if source.is_symlink() or not source.is_file() or source.stat().st_size > 1024 * 1024:
         raise ValueError('WireGuard configuration must be a bounded regular file')
 
@@ -464,6 +464,9 @@ def configure_wireguard(cfg: Config):
     config = json.loads(source.read_text(), object_pairs_hook=unique_fields)
     if config.get('format') != 'cocoon-wireguard-config-v1':
         raise ValueError('Unsupported WireGuard configuration format')
+    tee_type = config.get('attestation', {}).get('type')
+    if tee_type not in ('tdx', 'fake_tee') or (tee_type == 'fake_tee' and not cfg.no_tee):
+        raise ValueError('fake_tee WireGuard configuration requires --no-tee')
     for key in ('listen_port', 'admission_port'):
         if type(config[key]) is not int or not 1024 <= config[key] <= 65535:
             raise ValueError(f'WireGuard {key} must be a measured integer port')
@@ -605,6 +608,12 @@ def prepare_spec(cfg: Config):
     shutil.copytree(cfg.spec_dir, dest)
     if cfg.wireguard_config:
         shutil.copyfile(cfg.wireguard_config, Path(dest) / 'wireguard-config.json')
+        if cfg.no_tee:
+            # Debug mode is explicit in the prepared spec; runtime endpoint substitution cannot enable it.
+            path = Path(dest) / 'wireguard-config.json'
+            config = json.loads(path.read_text())
+            config['attestation']['type'] = 'fake_tee'
+            path.write_text(json.dumps(config, indent=2) + '\n')
         if cfg.wireguard_membership:
             runtime = Path(dest) / 'runtime'
             runtime.mkdir(exist_ok=True)

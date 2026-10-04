@@ -1,8 +1,8 @@
 # WireGuard service for confidential workers
 
-This implements steps 1–5 of the CVM overlay plan: strict configuration, protected identities, signed membership, fresh mutually attested admission, WireGuard setup, lease/liveness supervision, and opt-in guest/launcher integration. `run` opens workload traffic only after the required group is admitted and healthy, renews admission, and withdraws access on failure. `setup` remains a diagnostic with workload traffic blocked. The image build installs the daemon, tools, preparation helper and unit; measured worker configuration opts in. Distributed engine rank launch and real two-CVM acceptance remain separate work.
+The service implementation and step-6 acceptance tooling are available: strict configuration, protected identities, signed membership, fresh mutually attested admission, WireGuard setup, lease/liveness supervision, opt-in guest/launcher integration, and a [two-CVM acceptance procedure](acceptance.md). `run` opens workload traffic only after the required group is admitted and healthy, renews admission, and withdraws access on failure. `setup` remains a diagnostic with workload traffic blocked. The image build installs the daemon, tools, preparation helper and unit; measured worker configuration opts in. Full new image build/boot, real two-CVM acceptance and distributed engine rank launch remain outstanding.
 
-**An enrollment export is not attestation evidence.** It carries `attestation_status: "not_collected"`. The signing helper authorizes the supplied identities; it does not verify their hardware evidence. `verify-membership` verifies the operator signature, allocation, validity, and local identity, not remote TDX quotes. Live peer admission must independently verify evidence before enabling workload traffic.
+**An enrollment export is not hardware attestation evidence.** Real-mode exports carry `attestation_status: "not_collected"`; explicit fake-mode exports carry `"synthetic"`. The signing helper authorizes the supplied identities; it does not verify their hardware evidence. `verify-membership` verifies the operator signature, allocation, validity, and local identity, not remote TDX quotes. Live peer admission independently checks the configured evidence mode before enabling workload traffic.
 
 ## Build and check
 
@@ -12,10 +12,38 @@ build/tee/test-wireguard
 build/tee/test-wireguard-admission
 build/tee/cocoon-wireguard --help
 python3 tee/test/wireguard-cli.py build/tee/cocoon-wireguard
+python3 tee/test/wireguard-fake-tee.py build/tee/cocoon-wireguard
 python3 tee/test/wireguard-integration.py build/tee/cocoon-wireguard
+python3 tee/test/wireguard-acceptance.py
 ```
 
-The executable is a Linux target and uses the existing OpenSSL, JSON, and Cocoon dependencies. The local tests need ordinary loopback UDP and Unix datagram access but require no elevated networking privileges or TDX hardware. If installed, the `ip` helper is also exercised for read-only link inventory. The application network sandbox may block those operations. Actual `admit-peer`, `setup`, and `run` execution requires real TDX/DCAP support and confidential guests. `cleanup` performs no admission and works without that SDK.
+The executable is a Linux target and uses the existing OpenSSL, JSON, and Cocoon dependencies. The local tests need ordinary loopback UDP and Unix datagram access but require no elevated networking privileges or TDX hardware. If installed, the `ip` helper is also exercised for read-only link inventory. The application network sandbox may block those operations. Real-mode `admit-peer`, `setup`, and `run` require TDX/DCAP and confidential guests; explicit fake mode runs without that SDK or hardware. Actual WireGuard setup still needs Linux WireGuard/nftables support and guest root. `cleanup` performs no admission and works without that SDK.
+
+`check-gate --config FILE` is read-only: it checks the exact static owned firewall and prints its current nftables JSON, including timed-set elements. It does not acquire the live daemon's identity lock, generate keys, flush permissions or claim fresh attestation. Missing or altered gates fail. The [acceptance checker](acceptance.py) combines that inventory with live systemd state, fresh status, exact public keys/routes and temporary device-bound TCP/UDP exchanges; it supports TDX and explicitly booted fake-mode guests and never changes peer or firewall configuration. The image also packages a [Gloo/NCCL smoke test](collective.py) for use in the approved inference container. Follow the [acceptance runbook](acceptance.md) for installation, failure tests, collective logs and the pending hardware evidence ledger.
+
+## Debug guests with `--no-tee`
+
+Launch a WireGuard-enabled worker using the existing `scripts/cocoon-launch --no-tee` flag. The launcher changes `attestation.type` to `fake_tee` in the prepared spec, preserves the source configuration, and retains endpoint forwarding. The guest requires `cocoon_no_tee` to match that explicit policy and propagates `--no-tee` to enrollment, membership verification, the daemon and cleanup. Missing TDX hardware never automatically selects fake mode. `--no-cc` alone keeps real attestation selected.
+
+Use the normal bootstrap procedure with a fresh enrollment from each debug guest. Every member of the signed payload must have `tee_type: "fake_tee"` and its synthetic image hash. Read the existing `<cert_base_name>_image_hash.b64` emitted by `gen-cert --tee fake_tee` and convert it to hex, for example:
+
+```bash
+python3 -c 'import base64,sys; print(base64.b64decode(open(sys.argv[1]).read()).hex())' /etc/tee/tee_image_hash.b64
+```
+
+Both Intel and AMD fake certificates are supported, including a pair with different CPU vendors. Intel fake measurements are now zero-initialized so the reported image hash is deterministic; AMD fake VCEK generation also initializes its OpenSSL key pointer. The example `signed_membership` policy works in fake mode; a pinned allowlist must contain the synthetic hashes. A real membership cannot be reused. Fake membership uses the distinct signed binary domain `cocoon/wg-membership/fake-tee/v1` followed by NUL; real v1 signatures and identities retain their existing encoding. Mixed real/fake membership and reuse of a real-mode identity directory fail.
+
+For direct daemon use, set `attestation.type` to `fake_tee` in the configuration and pass the standalone flag on every configuration command:
+
+```bash
+cocoon-wireguard enroll --config worker-fake.json --no-tee
+cocoon-wireguard verify-membership --config worker-fake.json --membership cluster-membership.json --no-tee
+cocoon-wireguard run --config worker-fake.json --membership cluster-membership.json --no-tee
+```
+
+The signing command needs no flag: it signs the explicit mode in the payload. Loopback admission endpoints are accepted only in fake mode, allowing local two-process admission tests. Overlay addresses still require the same private subnet allocations. The guest acceptance checker automatically reads the matching boot/config mode; admission, setup, status, acceptance and collective reports identify `attestation_type: "fake_tee"`.
+
+Fake reports are forgeable and prove no hardware isolation, guest measurement or TCB state. Debug mode retains membership signatures, exact signed keys/context, TLS possession and fresh transcript checks, leases, authenticated overlay probes/heartbeats, timed firewall permissions and cleanup. Passing debug tests demonstrates those mechanisms, not confidential-computing attestation. Real workers continue to require DCAP and reject fake grants/evidence.
 
 ## Trusted configuration
 
@@ -42,7 +70,7 @@ Both configurations must agree on cluster, workload digest, generation, and memb
 | `listen_port`, `admission_port` | Local guest UDP and TCP ports, each 1024–65535 |
 | `cert_base_name` | Absolute normalized certificate/key base path; existence is checked during admission, not configuration parsing |
 | `membership_signer_public_key_b64` | Pinned 32-byte Ed25519 public key, canonical padded standard base64 |
-| `attestation` | `type: "tdx"` with either `image_policy: "signed_membership"` or a nonempty bounded `allowed_image_hashes_hex` list; no permissive/fake modes |
+| `attestation` | `type: "tdx"` or explicit debug `"fake_tee"`, with either `image_policy: "signed_membership"` or a nonempty bounded `allowed_image_hashes_hex` list; fake mode also requires `--no-tee` |
 | `peers` | All other nodes, with unique IDs/ranks/addresses and unique UDP/TCP endpoint pairs; endpoints are canonical non-loopback unicast IPv4 outside the overlay subnet |
 | `mtu` | Optional, 1280–1420; defaults to 1400; path-MTU checks follow during network setup |
 | `keepalive_seconds` | Optional, 0–120; defaults to 25; zero disables keepalive |
@@ -142,7 +170,7 @@ cocoon-wireguard admit-peer \
 
 The higher-ranked participant listens; the lower-ranked participant connects. Ensure the host forwards the peer's configured TCP admission endpoint to the guest's `admission_port`. A connection attempt uses bounded exponential backoff from 100ms to 2s. Once connected, certificate or protocol rejection fails the invocation. This diagnostic accepts one session and closes on completion or failure; `run` coordinates successive rank pairs and repeats fresh admission during renewal.
 
-The command performs a full TLS 1.3 handshake using Cocoon's context helper and existing certificate OIDs. Both certificates must be self-signed Ed25519 certificates with exactly one critical TDX quote extension and one critical matching user-claims extension. Missing, duplicate, SEV, unexpected critical, expired, or invalid evidence fails. DCAP verifies the certificate quote without a shared cache; the resulting TLS public key binding, approved image, and platform attributes are checked before the admission exchange proceeds.
+The command performs a full TLS 1.3 handshake using Cocoon's context helper and existing certificate OIDs. In real mode, both certificates must be self-signed Ed25519 certificates with exactly one critical TDX quote extension and one critical matching user-claims extension. Missing, duplicate, SEV, unexpected critical, expired, or invalid evidence fails. DCAP verifies the certificate quote without a shared cache; the resulting TLS public key binding, approved image, and platform attributes are checked before the admission exchange proceeds. Explicit fake mode uses the synthetic Intel/AMD formats described above.
 
 Both guests then generate independent random 32-byte challenges. They check the exact expected peer ID and canonical signed-membership digest, and reconstruct the same binary admission record:
 
@@ -164,11 +192,11 @@ Each guest requests a new remotely verifiable TDX quote with `REPORTDATA = SHA-5
 
 The initiator sends its quote first; the responder verifies it before sending its own. Both exchange an acceptance message containing `SHA-256(record)` only after verifying their peer. Membership is checked again after verification and immediately before returning success, so expiry during admission fails. Frames have a 4-byte big-endian length and a one-byte type: hello=1, quote=2, acceptance=3. Payloads are bounded before allocation (hello at most 136 bytes, quote at most 32 KiB, acceptance exactly 32 bytes); truncated, unexpected, and malformed frames fail.
 
-The total connection/admission work uses the configured startup deadline. TLS establishment also uses the shorter handshake deadline. Nonblocking sockets and separately owned evidence workers allow SIGINT/SIGTERM cancellation. Potentially blocking quote generation and DCAP verification run in an exec'd child with bounded input/output; timeout or cancellation kills and reaps the worker. A worker also requests termination when its parent dies. There is no production fake-verification switch; a build without the real SDK libraries rejects `admit-peer` before creating a listener or identity.
+The total connection/admission work uses the configured startup deadline. TLS establishment also uses the shorter handshake deadline. Nonblocking sockets and separately owned evidence workers allow SIGINT/SIGTERM cancellation. Potentially blocking quote generation and DCAP verification run in an exec'd child with bounded input/output; timeout or cancellation kills and reaps the worker. A worker also requests termination when its parent dies. Real mode rejects unsupported builds before creating a listener or identity. Debug mode requires both `--no-tee` and an explicit fake configuration and uses synthetic Cocoon reports.
 
 Success prints public JSON with `status: "peer_admitted"`, the verified peer key/boot/image, evidence and transcript hashes, membership generation, and expiry. **This is a diagnostic result of that session, not a reusable authorization token or proof of continuing connectivity.** `workload_ready` remains false. The command does not create an interface, install a WireGuard peer, or continuously enforce a lease. `run` consumes the live admission capability and performs network probes before enabling workload traffic.
 
-Local tests use synthetic evidence strictly inside the separate test executable. They cover real TLS exchanges, replay and context changes, certificate rejection, frame bounds, expiry, and cancellation/cleanup of a blocked verifier. They do not demonstrate genuine quote generation or successful DCAP verification. Before CVM deployment, build with the actual TDX/DCAP libraries and test this sequence on two approved guests, including substituted keys, old quotes, expired membership, and guest restart. The wall-clock and VM-suspension assumptions described above still apply.
+Local tests use fixture evidence and the actual fake-TEE provider, including real two-process CLI admission. They cover real TLS exchanges, replay and context changes, certificate rejection, frame bounds, expiry, and cancellation/cleanup of a blocked verifier. They do not demonstrate genuine quote generation or successful DCAP verification. Before CVM deployment, build with the actual TDX/DCAP libraries and test this sequence on two approved guests, including substituted keys, old quotes, expired membership, and guest restart. The wall-clock and VM-suspension assumptions described above still apply.
 
 Protocol references: [Intel TDX quote API](https://raw.githubusercontent.com/intel/confidential-computing.tee.dcap/main/QuoteGeneration/quote_wrapper/tdx_attest/tdx_attest.h), [Linux TDX attribute definitions](https://raw.githubusercontent.com/torvalds/linux/master/arch/x86/include/asm/shared/tdx.h), and [OpenSSL TLS exporter](https://docs.openssl.org/4.1/man3/SSL_export_keying_material/).
 
@@ -195,7 +223,7 @@ For each member sorted by node_id in ASCII order:
     32 bytes image hash
 ```
 
-The v1 schema permits TDX members only. The JSON input explicitly requires `tee_type: "tdx"`; the binary protocol domain fixes that platform for v1. Binary decoding rejects truncated, trailing, duplicate, invalid, or noncanonical records. JSON field order, whitespace, and member array order do not affect the signed payload. Signature and payload encodings use canonical padded standard base64. A membership signature authorizes values; fresh hardware evidence must still bind the admitted key and context.
+Real v1 membership requires every JSON member to have `tee_type: "tdx"` and retains the binary domain above. Fake membership requires every member to have `tee_type: "fake_tee"` and replaces only that domain with `cocoon/wg-membership/fake-tee/v1` followed by NUL. The signed mode must match the configuration; mixed membership is rejected. Binary decoding rejects truncated, trailing, duplicate, invalid, or noncanonical records. JSON field order, whitespace, and member array order do not affect the signed payload. Signature and payload encodings use canonical padded standard base64. A membership signature authorizes values; fresh hardware evidence must still bind the admitted key and context.
 
 Run the complete CLI integration test, including independent OpenSSL signature verification, with:
 
@@ -314,7 +342,7 @@ wireguard_udp_port = 51820
 wireguard_admission_port = 51821
 ```
 
-Default host ports come from the measured local UDP `listen_port` and TCP `admission_port`. Host mappings add `instance * 10`; guest ports stay unchanged. For instance 1 with guest ports 51820/51821, the host accepts UDP **51830** and admission TCP **51831**. Put these actual host ports and routable host addresses in other workers' endpoint hints. The launcher reports both mappings and the membership-delivery path. It rejects port overflow, duplicate mappings, negative instances, non-worker use and `--no-tee` with WireGuard. Optional `--udp PORT` follows the same general offset convention; these extra mappings do not create guest firewall permissions.
+Default host ports come from the measured local UDP `listen_port` and TCP `admission_port`. Host mappings add `instance * 10`; guest ports stay unchanged. For instance 1 with guest ports 51820/51821, the host accepts UDP **51830** and admission TCP **51831**. Put these actual host ports and routable host addresses in other workers' endpoint hints. The launcher reports both mappings and the membership-delivery path. It rejects port overflow, duplicate mappings, negative instances, non-worker use and local-mode WireGuard. `--no-tee` explicitly selects the separate fake mode described above. Optional `--udp PORT` follows the same general offset convention; these extra mappings do not create guest firewall permissions.
 
 Bootstrap:
 
@@ -341,7 +369,7 @@ Preparation renders endpoint IPv4/UDP/TCP hints only. It compares every other fi
 
 Existing guest INPUT policy defaults to drop, so preparation adds exact marked rules for the configured outer UDP port, admission TCP port, and decrypted traffic on the owned overlay interface. The independent nftables gate is installed first and still enforces exact peers, workload leases and fallback drops; the base INPUT exception cannot override those drops. Post-stop cleanup removes only these marked INPUT rules after closing/removing the overlay and keeps the nftables guard. No global ruleset is flushed.
 
-The opted-in backend uses Docker host networking and forces NCCL Socket transport with InfiniBand disabled and NCCL/Gloo socket interfaces set to WireGuard. NCCL uses an exact interface match (`-e NCCL_SOCKET_IFNAME==wg0` for `wg0`), following [NVIDIA's interface selection syntax](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-socket-ifname). Both the engine and `cocoon-worker-runner.service` bind to overlay availability. `/run/cocoon-wireguard/workload.env` exposes `COCOON_OVERLAY_INTERFACE`, `COCOON_OVERLAY_IPV4`, `COCOON_NODE_RANK`, and `COCOON_OVERLAY_STATUS` to the bound service processes. The router remains independently available. Existing backend image/version choices are retained.
+The opted-in backend uses Docker host networking and forces NCCL Socket transport with InfiniBand disabled and NCCL/Gloo socket interfaces set to WireGuard. NCCL uses an exact interface match (`-e NCCL_SOCKET_IFNAME==wg0` for `wg0`), IPv4 and separate OOB network selection disabled, following [NVIDIA's transport/interface options](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html). Both the engine and `cocoon-worker-runner.service` bind to overlay availability. `/run/cocoon-wireguard/workload.env` exposes `COCOON_OVERLAY_INTERFACE`, `COCOON_OVERLAY_IPV4`, `COCOON_NODE_RANK`, and `COCOON_OVERLAY_STATUS` to the bound service processes. The router remains independently available. Existing backend image/version choices are retained.
 
 If initial delivery misses a startup window or the group loses readiness, serving stays stopped. After supplying a current grant and restoring overlay readiness, explicitly start the bound engine and worker runner on all nodes together. For an otherwise completed bootstrap that timed out waiting for membership:
 
@@ -358,7 +386,7 @@ Step-5 checks passed 445 enrollment assertions, 1,042 admission/supervision asse
 
 ## Kernel integration test
 
-The local admission test includes synthetic-evidence admission, sealed-key ownership, command failure injection before/after mutations, route/interface conflicts, retained-gate validation/upgrade, peer rollback, and real loopback UDP probes at MTUs 1280, 1400 and 1420. It also checks packet loss and probe/heartbeat replay, delayed/out-of-order heartbeat handling, monotonic expiry, lease extension binding, optional-peer removal decisions, timed gate transactions, atomic status, notification/watchdog messages, ownership-safe crash cleanup, and teardown after gate failure. Synthetic evidence appears only in the test executable; production admission/setup/run has no fake attestation switch.
+The local admission test includes synthetic-evidence admission, sealed-key ownership, command failure injection before/after mutations, route/interface conflicts, retained-gate validation/upgrade, peer rollback, and real loopback UDP probes at MTUs 1280, 1400 and 1420. It also checks packet loss and probe/heartbeat replay, delayed/out-of-order heartbeat handling, monotonic expiry, lease extension binding, optional-peer removal decisions, timed gate transactions, atomic status, notification/watchdog messages, ownership-safe crash cleanup, and teardown after gate failure. The explicit debug provider is also tested with actual Intel/AMD fake certificates, fresh challenges and mode isolation. Default production admission/setup/run still requires real TDX.
 
 On a Linux test machine with root, network/mount namespace support, nftables, and a WireGuard-capable kernel:
 
@@ -369,3 +397,5 @@ sudo python3 tee/test/wireguard-network.py build/tee/test-wireguard-admission
 The harness creates an outer network namespace and private mount namespace, then two worker namespaces connected by a veth pair. It checks real kernel WireGuard setup, the authenticated MTU probe, closed-gate blocking, authorized ordinary workload UDP, automatic kernel permission expiry while the interface stays up, cleanup/restart, and interface-loss detection. Its veth links never enter the host network namespace; `/run/netns` exists in a private temporary mount. Attestation is synthetic in this harness. A non-root invocation exits 77 with a skip explanation.
 
 This workspace cannot create the required namespaces, including outside the application sandbox. The kernel integration harness has not been run here. Real TDX/DCAP admission and encrypted traffic between two actual CVMs still require hardware validation before enabling workloads.
+
+Explicit fake-mode checks passed 456 enrollment assertions, 1,164 admission/supervision assertions, 34 existing CLI checks, 45 new actual fake-mode CLI checks, 16 guest/launcher tests and 17 acceptance tests. Actual gen-cert hashes were repeatable; ASan/UBSan, TDX-SDK syntax and the systemd fake-mode override passed. Full guest boot and kernel overlay traffic remain pending.

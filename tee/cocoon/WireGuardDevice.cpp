@@ -276,6 +276,15 @@ Json flush_permissions(const Config &config) {
 }  // namespace
 
 std::unique_ptr<NetworkCommands> real_network_commands() { return std::make_unique<RealNetworkCommands>(); }
+std::string inspect_guard(const Config &config, NetworkCommands &commands, const Deadline &deadline) {
+  auto current = Json::parse(commands.run(NetworkTool::Nftables,
+      {"-j", "list", "table", "inet", "cwg_" + config.interface}, {}, -1,
+      deadline.within(std::chrono::seconds(5))));
+  require(current.is_object() && current.contains("nftables") &&
+      normalize_guard(current["nftables"]) == normalize_guard(guard_objects(config)),
+      "Installed overlay firewall differs from the owned gate");
+  return current.dump(2) + "\n";
+}
 void install_closed_guard(const Config &config, NetworkCommands &commands, const Deadline &deadline) {
   auto run = [&](std::vector<std::string> args, std::string_view input = {}) {
     return commands.run(NetworkTool::Nftables, args, input, -1, deadline.within(std::chrono::seconds(5)));
@@ -485,12 +494,13 @@ void cleanup_overlay(const Config &config, const std::string &state_dir, Network
     commands.run(NetworkTool::Ip, {"link", "delete", "dev", config.interface}, {}, -1, deadline);
   }
   write_runtime_status(state_dir, Json{{"format", "cocoon-wireguard-status-v1"}, {"state", "stopped"},
+      {"attestation_type", config.fake_tee ? "fake_tee" : "tdx"},
       {"workload_ready", false}, {"interface", config.interface}}.dump(2) + "\n");
 }
 
 void setup_overlay(const Config &config, const std::string &state_dir, std::string_view signed_membership,
                    std::function<bool()> cancelled, std::function<void(std::string_view)> report) {
-  require(admission_supported(), "This build has no real TDX/DCAP support; overlay setup is disabled");
+  require(admission_supported(config), "This build has no real TDX/DCAP support; overlay setup is disabled");
   RuntimeIdentity identity(config, state_dir);
   auto now = std::time(nullptr);
   require(now >= 0, "Cannot read current time");
@@ -523,6 +533,7 @@ void setup_overlay(const Config &config, const std::string &state_dir, std::stri
   startup.check();
   verify_membership(config, identity.identity(), signed_membership, static_cast<std::uint64_t>(std::time(nullptr)));
   report(Json{{"format", "cocoon-wireguard-setup-v1"}, {"status", "overlay_probed"}, {"workload_ready", false},
+      {"attestation_type", config.fake_tee ? "fake_tee" : "tdx"},
       {"interface", config.interface}, {"overlay_ipv4", config.overlay_ipv4}, {"generation", membership.generation},
       {"expires_at", membership.expires_at}, {"peers", peers}}.dump(2) + "\n");
   Deadline lifetime(lease_end, cancelled);

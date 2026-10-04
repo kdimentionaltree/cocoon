@@ -66,6 +66,7 @@ struct LeaseSupervisor::Impl {
   std::map<std::string, PeerState> peers;
   Impl(const Config &c, const Membership &m, Clock::time_point now, std::uint64_t wall)
       : config(c), membership(m), membership_hash(digest(encode_membership(m))), membership_until(lease_end(m, now, wall)) {
+    require(c.fake_tee == m.fake_tee, "Supervisor membership attestation mode mismatch");
     for (const auto &peer : c.peers) peers.try_emplace(peer.node_id);
   }
   Clock::time_point peer_until(const PeerState &peer, Clock::time_point now, std::uint64_t wall) const {
@@ -206,6 +207,7 @@ std::string LeaseSupervisor::status(std::string_view phase, bool ready, Clock::t
         {"lease_remaining_ms", std::max<std::int64_t>(0, std::chrono::duration_cast<std::chrono::milliseconds>(end - now).count())}});
   }
   return Json{{"format", "cocoon-wireguard-status-v1"}, {"state", phase}, {"workload_ready", ready},
+      {"attestation_type", impl_->config.fake_tee ? "fake_tee" : "tdx"},
       {"interface", impl_->config.interface}, {"overlay_ipv4", impl_->config.overlay_ipv4},
       {"generation", impl_->membership.generation}, {"expires_at", impl_->membership.expires_at},
       {"updated_at", wall}, {"membership_sha256", hex(impl_->membership_hash)}, {"rejection_reason", reason}, {"peers", peers}}.dump(2) + "\n";

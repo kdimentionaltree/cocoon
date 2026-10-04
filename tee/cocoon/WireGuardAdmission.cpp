@@ -130,21 +130,29 @@ std::string extension(X509 *certificate, const char *oid) {
 Evidence verify_certificate(X509 *certificate, const Config &config, EvidenceProvider &provider,
                             const Deadline &deadline, std::string_view expected_image) {
   auto public_key = tls_key(certificate);
+  bool sev = false, tdx = false;
   for (int i = 0; i < X509_get_ext_count(certificate); ++i) {
     auto ext = X509_get_ext(certificate, i);
     std::array<char, 128> oid{};
     auto size = OBJ_obj2txt(oid.data(), static_cast<int>(oid.size()), X509_EXTENSION_get_object(ext), 1);
     require(size > 0 && size < static_cast<int>(oid.size()), "Invalid certificate OID");
     auto name = std::string_view(oid.data(), static_cast<std::size_t>(size));
-    require(!name.starts_with("1.3.6.1.4.1.12345.") || name == "1.3.6.1.4.1.12345.1" ||
-                name == "1.3.6.1.4.1.12345.2", "Non-TDX attestation extensions are forbidden");
+    bool tdx_oid = name == "1.3.6.1.4.1.12345.1" || name == "1.3.6.1.4.1.12345.2";
+    bool sev_oid = config.fake_tee && (name == "1.3.6.1.4.1.12345.100" ||
+        name == "1.3.6.1.4.1.12345.101" || name == "1.3.6.1.4.1.12345.102");
+    tdx |= tdx_oid; sev |= sev_oid;
+    require(!name.starts_with("1.3.6.1.4.1.12345.") || tdx_oid || sev_oid,
+            "Unsupported attestation extensions are forbidden");
     require(!X509_EXTENSION_get_critical(ext) || X509_supported_extension(ext) ||
-                name == "1.3.6.1.4.1.12345.1" || name == "1.3.6.1.4.1.12345.2",
+                tdx_oid || sev_oid,
             "Unknown critical certificate extension");
   }
-  require(extension(certificate, "1.3.6.1.4.1.12345.2") == public_key,
+  require(!(tdx && sev), "Mixed certificate attestation extensions are forbidden");
+  require(extension(certificate, sev ? "1.3.6.1.4.1.12345.100" : "1.3.6.1.4.1.12345.2") ==
+              (sev ? digest(public_key, EVP_sha512()) : public_key),
           "Certificate user claims do not match its TLS key");
-  auto evidence = provider.verify(extension(certificate, "1.3.6.1.4.1.12345.1"), deadline);
+  if (sev) extension(certificate, "1.3.6.1.4.1.12345.102");
+  auto evidence = provider.verify(extension(certificate, sev ? "1.3.6.1.4.1.12345.101" : "1.3.6.1.4.1.12345.1"), deadline);
   check_evidence(evidence, digest(public_key, EVP_sha512()), expected_image);
   require(config.image_policy == ImagePolicy::SignedMembership ||
               std::find(config.allowed_image_hashes_hex.begin(), config.allowed_image_hashes_hex.end(),
@@ -492,6 +500,7 @@ std::string admit_connected_socket(int socket, bool server, const Config &config
     verify_membership(config, identity, signed_membership, wall_time());
   }
   return nlohmann::json{{"format", "cocoon-wireguard-admission-v1"}, {"status", "peer_admitted"},
+                        {"attestation_type", config.fake_tee ? "fake_tee" : "tdx"},
                         {"workload_ready", false}, {"peer_node_id", remote_member.node_id},
                         {"peer_boot_id", remote_member.boot_id}, {"peer_overlay_ipv4", remote_member.overlay_ipv4},
                         {"peer_wireguard_public_key_b64", remote_member.wireguard_public_key_b64},
@@ -506,7 +515,7 @@ std::string admit_connected_socket(int socket, bool server, const Config &config
 std::string admit_peer(const Config &config, const Identity &identity, std::string_view signed_membership,
                        std::string_view peer_node, std::function<bool()> cancelled,
                        const AfterAdmission &after_admission, std::function<void()> progress) {
-  auto provider = real_evidence_provider();
+  auto provider = evidence_provider(config);
   auto peer = std::find_if(config.peers.begin(), config.peers.end(),
                             [&](const auto &p) { return p.node_id == peer_node; });
   require(peer != config.peers.end(), "Peer is not configured");

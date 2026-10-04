@@ -25,7 +25,7 @@ class FakeTdxTee : public cocoon::TeeInterface {
   }
 
   td::Result<cocoon::RATLSAttestationReport> make_report(const td::UInt512& user_claims) const override {
-    RATLSAttestationReport report;
+    RATLSAttestationReport report{};
 
     report.reportdata = user_claims;
 

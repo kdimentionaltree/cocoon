@@ -132,7 +132,7 @@ def main():
         run(binary, "check-config", "--config", str(configurations[0]), "--config", str(configurations[1]), code=1)
         run(binary, "--internal-quote", input_bytes=b"invalid-reportdata", code=1)
         run(binary, "--internal-verify", input_bytes=b"invalid-quote", code=1)
-        # Never allow an admission flag to select synthetic verification.
+        # Unsupported legacy options cannot bypass the explicit configuration mode.
         run(binary, "admit-peer", "--config", str(configurations[0]), "--membership", str(envelope_path),
             "--peer", "worker-b", "--fake-tee", "true", code=1)
         run(binary, "setup", "--config", str(configurations[0]), "--membership", str(envelope_path),

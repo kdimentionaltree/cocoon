@@ -21,6 +21,7 @@ void stop_admission(int) { cancelled = 1; }
 void usage() {
   std::cout << "Usage:\n"
                "  cocoon-wireguard check-config --config FILE\n"
+               "  cocoon-wireguard check-gate --config FILE\n"
                "  cocoon-wireguard enroll --config FILE [--state-dir /run/cocoon-wireguard] [--output FILE]\n"
                "  cocoon-wireguard sign-membership --payload FILE --signing-key PEM [--output FILE]\n"
                "  cocoon-wireguard verify-membership --config FILE --membership FILE "
@@ -31,7 +32,8 @@ void usage() {
                "  cocoon-wireguard cleanup --config FILE [--state-dir /run/cocoon-wireguard]\n"
                "  cocoon-wireguard setup --config FILE --membership FILE "
                "[--state-dir /run/cocoon-wireguard] [--output FILE]\n"
-               "\nAdmission, setup, and run require real TDX/DCAP.\n"
+               "\nUse --no-tee on configuration commands with attestation.type=fake_tee for debug admission.\n"
+               "Otherwise admission, setup, and run require real TDX/DCAP.\n"
                "setup holds a closed diagnostic overlay; run supervises authorized workload traffic.\n";
 }
 
@@ -59,7 +61,7 @@ int main(int argc, char **argv) {
     }
     std::string command = argv[1];
     std::set<std::string> required, optional;
-    if (command == "check-config") {
+    if (command == "check-config" || command == "check-gate") {
       required = {"--config"};
     } else if (command == "enroll") {
       required = {"--config"};
@@ -85,12 +87,19 @@ int main(int argc, char **argv) {
     } else {
       throw wg::Error("Unknown command; use --help");
     }
+    if (command != "sign-membership") optional.insert("--no-tee");
     std::map<std::string, std::string> options;
-    for (int i = 2; i < argc; i += 2) {
-      std::string key = argv[i];
-      if (i + 1 >= argc || (!required.contains(key) && !optional.contains(key)) ||
-          !options.emplace(key, argv[i + 1]).second) {
+    for (int i = 2; i < argc;) {
+      std::string key = argv[i++];
+      if ((!required.contains(key) && !optional.contains(key)) || options.contains(key)) {
         throw wg::Error("Unknown, duplicate, or incomplete command option");
+      }
+      if (key == "--no-tee") options.emplace(key, "true");
+      else {
+        if (i >= argc || std::string_view(argv[i]).starts_with("--")) {
+          throw wg::Error("Incomplete command option");
+        }
+        options.emplace(key, argv[i++]);
       }
     }
     for (const auto &key : required) {
@@ -99,17 +108,24 @@ int main(int argc, char **argv) {
       }
     }
     std::string output;
-    if ((command == "admit-peer" || command == "setup" || command == "run") && !wg::admission_supported()) {
-      throw wg::Error("This build has no real TDX/DCAP support; peer admission is disabled");
-    }
     if (command == "sign-membership") {
       auto membership = wg::parse_membership_payload(wg::read_public_file(options.at("--payload")));
       SigningSecret secret{wg::read_private_file(options.at("--signing-key"))};
       output = wg::sign_membership(membership, secret.pem);
     } else {
       auto config = wg::parse_config(wg::read_public_file(options.at("--config")));
+      if (config.fake_tee != options.contains("--no-tee")) {
+        throw wg::Error("--no-tee must be used exactly with attestation.type=fake_tee");
+      }
+      if ((command == "admit-peer" || command == "setup" || command == "run") && !wg::admission_supported(config)) {
+        throw wg::Error("This build has no real TDX/DCAP support; peer admission is disabled");
+      }
       if (command == "check-config") {
         output = "Configuration valid\n";
+      } else if (command == "check-gate") {
+        auto commands = wg::real_network_commands();
+        output = wg::inspect_guard(config, *commands,
+            wg::Deadline(wg::Deadline::Clock::now() + std::chrono::seconds(5)));
       } else {
         auto state_dir = options.contains("--state-dir") ? options.at("--state-dir") : "/run/cocoon-wireguard";
         if (command == "cleanup") {
