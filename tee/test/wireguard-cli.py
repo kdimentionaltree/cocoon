@@ -135,6 +135,11 @@ def main():
         # Never allow an admission flag to select synthetic verification.
         run(binary, "admit-peer", "--config", str(configurations[0]), "--membership", str(envelope_path),
             "--peer", "worker-b", "--fake-tee", "true", code=1)
+        run(binary, "setup", "--config", str(configurations[0]), "--membership", str(envelope_path),
+            "--fake-tee", "true", code=1)
+        run(binary, "run", "--config", str(configurations[0]), "--membership", str(envelope_path),
+            "--fake-tee", "true", code=1)
+        run(binary, "cleanup", "--config", str(configurations[0]), "--membership", str(envelope_path), code=1)
         probe_state = directory / "unsupported-admission"
         probe = subprocess.run(
             [binary, "admit-peer", "--config", str(configurations[0]), "--membership", str(envelope_path),
@@ -145,6 +150,14 @@ def main():
         assert probe.returncode == 1 and probe.stdout == b""
         if b"no real TDX/DCAP support" in probe.stderr:
             assert not probe_state.exists(), "Unsupported build created admission state"
+            setup_state = directory / "unsupported-setup"
+            run(binary, "setup", "--config", str(configurations[0]), "--membership", str(envelope_path),
+                "--state-dir", str(setup_state), code=1)
+            assert not setup_state.exists(), "Unsupported build created setup state"
+            run_state = directory / "unsupported-run"
+            run(binary, "run", "--config", str(configurations[0]), "--membership", str(envelope_path),
+                "--state-dir", str(run_state), code=1)
+            assert not run_state.exists(), "Unsupported build created supervisor state"
         else:
             assert b"Peer is not configured" in probe.stderr
 

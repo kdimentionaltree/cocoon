@@ -1,5 +1,7 @@
 #include "WireGuardEnrollment.h"
 #include "WireGuardAdmission.h"
+#include "WireGuardDevice.h"
+#include "WireGuardSupervisor.h"
 
 #include <csignal>
 #include <ctime>
@@ -25,7 +27,12 @@ void usage() {
                "[--state-dir /run/cocoon-wireguard]\n"
                "  cocoon-wireguard admit-peer --config FILE --membership FILE --peer NODE "
                "[--state-dir /run/cocoon-wireguard] [--output FILE]\n"
-               "\nEnrollment exports public material only. admit-peer requires real TDX/DCAP; network setup follows later.\n";
+               "  cocoon-wireguard run --config FILE --membership FILE [--state-dir /run/cocoon-wireguard]\n"
+               "  cocoon-wireguard cleanup --config FILE [--state-dir /run/cocoon-wireguard]\n"
+               "  cocoon-wireguard setup --config FILE --membership FILE "
+               "[--state-dir /run/cocoon-wireguard] [--output FILE]\n"
+               "\nAdmission, setup, and run require real TDX/DCAP.\n"
+               "setup holds a closed diagnostic overlay; run supervises authorized workload traffic.\n";
 }
 
 struct SigningSecret {
@@ -66,6 +73,15 @@ int main(int argc, char **argv) {
     } else if (command == "admit-peer") {
       required = {"--config", "--membership", "--peer"};
       optional = {"--state-dir", "--output"};
+    } else if (command == "setup") {
+      required = {"--config", "--membership"};
+      optional = {"--state-dir", "--output"};
+    } else if (command == "run") {
+      required = {"--config", "--membership"};
+      optional = {"--state-dir"};
+    } else if (command == "cleanup") {
+      required = {"--config"};
+      optional = {"--state-dir"};
     } else {
       throw wg::Error("Unknown command; use --help");
     }
@@ -83,7 +99,7 @@ int main(int argc, char **argv) {
       }
     }
     std::string output;
-    if (command == "admit-peer" && !wg::admission_supported()) {
+    if ((command == "admit-peer" || command == "setup" || command == "run") && !wg::admission_supported()) {
       throw wg::Error("This build has no real TDX/DCAP support; peer admission is disabled");
     }
     if (command == "sign-membership") {
@@ -96,6 +112,29 @@ int main(int argc, char **argv) {
         output = "Configuration valid\n";
       } else {
         auto state_dir = options.contains("--state-dir") ? options.at("--state-dir") : "/run/cocoon-wireguard";
+        if (command == "cleanup") {
+          auto commands = wg::real_network_commands();
+          wg::cleanup_overlay(config, state_dir, *commands,
+              wg::Deadline(wg::Deadline::Clock::now() + std::chrono::seconds(15)));
+          return 0;
+        }
+        if (command == "run") {
+          std::signal(SIGINT, stop_admission);
+          std::signal(SIGTERM, stop_admission);
+          wg::run_overlay(config, state_dir, options.at("--membership"), [] { return cancelled != 0; },
+              [](std::string_view status) { std::cout << status << std::flush; if (!std::cout) throw wg::Error("Cannot write status"); });
+          return 0;
+        }
+        if (command == "setup") {
+          std::signal(SIGINT, stop_admission);
+          std::signal(SIGTERM, stop_admission);
+          wg::setup_overlay(config, state_dir, wg::read_public_file(options.at("--membership")),
+              [] { return cancelled != 0; }, [&](std::string_view status) {
+                if (options.contains("--output")) wg::write_public_file(options.at("--output"), status);
+                else { std::cout << status << std::flush; if (!std::cout) throw wg::Error("Cannot write output"); }
+              });
+          return 0;
+        }
         auto identity = wg::load_or_create_identity(config, state_dir);
         if (command == "enroll") {
           output = wg::enrollment_json(config, identity);

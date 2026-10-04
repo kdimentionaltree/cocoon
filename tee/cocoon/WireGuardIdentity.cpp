@@ -1,14 +1,18 @@
 #include "WireGuardEnrollment.h"
+#include "WireGuardRuntimeIdentity.h"
 
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <utility>
 
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <linux/memfd.h>
 #include <unistd.h>
 
 #include <openssl/crypto.h>
@@ -226,7 +230,9 @@ void write_public_file(const std::string &path, std::string_view content) {
   }
 }
 
-Identity load_or_create_identity(const Config &config, const std::string &state_dir) {
+namespace {
+Identity use_identity(const Config &config, const std::string &state_dir,
+    const std::function<void(int, std::string_view)> &use_key = {}, bool create_if_missing = true) {
   auto dir = private_directory(state_dir);
   Fd lock(openat(dir.value, "identity.lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0600));
   if (lock.value < 0) {
@@ -268,6 +274,7 @@ Identity load_or_create_identity(const Config &config, const std::string &state_
     if (errno != ENOENT) {
       system_error("Cannot open saved identity");
     }
+    if (!create_if_missing) throw Error("No enrolled runtime identity exists");
     std::memcpy(state.bytes.data(), identity_magic, sizeof(identity_magic));
     std::memcpy(state.bytes.data() + sizeof(identity_magic), uuid.data(), uuid.size());
     if (RAND_priv_bytes(state.bytes.data() + boot_offset, 64) != 1) {
@@ -299,8 +306,63 @@ Identity load_or_create_identity(const Config &config, const std::string &state_
       throw;
     }
   }
-  return {hex(state.bytes.data() + boot_offset, 32),
-          derive_wireguard_public_key({reinterpret_cast<const char *>(state.bytes.data() + key_offset), 32})};
+  std::string_view key{reinterpret_cast<const char *>(state.bytes.data() + key_offset), 32};
+  Identity identity{hex(state.bytes.data() + boot_offset, 32), derive_wireguard_public_key(key)};
+  if (use_key) use_key(lock.value, key);
+  return identity;
+}
+}  // namespace
+
+Identity load_or_create_identity(const Config &config, const std::string &state_dir) {
+  return use_identity(config, state_dir);
+}
+
+RuntimeIdentity::RuntimeIdentity(const Config &config, const std::string &state_dir, bool create_if_missing) {
+  Fd held_lock(-1), key_file(-1);
+  identity_ = use_identity(config, state_dir, [&](int lock, std::string_view key) {
+    held_lock.value = fcntl(lock, F_DUPFD_CLOEXEC, 10);
+    key_file.value = static_cast<int>(syscall(SYS_memfd_create, "cocoon-wg-key", MFD_CLOEXEC | MFD_ALLOW_SEALING));
+    if (held_lock.value < 0 || key_file.value < 0 || fchmod(key_file.value, 0600) != 0) {
+      system_error("Cannot protect WireGuard runtime key");
+    }
+    std::array<unsigned char, 45> encoded{};
+    if (EVP_EncodeBlock(encoded.data(), reinterpret_cast<const unsigned char *>(key.data()), 32) != 44) {
+      throw Error("Cannot encode WireGuard runtime key");
+    }
+    encoded[44] = '\n';
+    try {
+      write_all(key_file.value, {reinterpret_cast<const char *>(encoded.data()), encoded.size()});
+    } catch (...) { OPENSSL_cleanse(encoded.data(), encoded.size()); throw; }
+    OPENSSL_cleanse(encoded.data(), encoded.size());
+    if (lseek(key_file.value, 0, SEEK_SET) < 0 ||
+        fcntl(key_file.value, F_ADD_SEALS, F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE) != 0) {
+      system_error("Cannot seal WireGuard runtime key");
+    }
+  }, create_if_missing);
+  lock_fd_ = std::exchange(held_lock.value, -1);
+  key_fd_ = std::exchange(key_file.value, -1);
+}
+RuntimeIdentity::~RuntimeIdentity() {
+  if (key_fd_ >= 0) close(key_fd_);
+  if (lock_fd_ >= 0) close(lock_fd_);
+}
+
+void write_runtime_status(const std::string &state_dir, std::string_view content) {
+  if (content.size() > 1024 * 1024) throw Error("Runtime status exceeds limit");
+  auto dir = private_directory(state_dir);
+  Fd existing(openat(dir.value, "status.json", O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC));
+  if (existing.value >= 0) private_permissions(existing.value, false);
+  else if (errno != ENOENT) system_error("Cannot inspect runtime status");
+  std::array<unsigned char, 16> random{};
+  if (RAND_bytes(random.data(), static_cast<int>(random.size())) != 1) throw Error("Cannot name runtime status");
+  auto name = ".status-" + hex(random.data(), random.size());
+  Fd file(openat(dir.value, name.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
+  if (file.value < 0) system_error("Cannot create runtime status");
+  try {
+    write_all(file.value, content);
+    if (fsync(file.value) != 0 || renameat(dir.value, name.c_str(), dir.value, "status.json") != 0 ||
+        fsync(dir.value) != 0) system_error("Cannot publish runtime status");
+  } catch (...) { unlinkat(dir.value, name.c_str(), 0); throw; }
 }
 
 }  // namespace cocoon::wireguard

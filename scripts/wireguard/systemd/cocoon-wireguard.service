@@ -1,0 +1,36 @@
+[Unit]
+Description=Cocoon attested WireGuard overlay
+Wants=network-online.target
+After=network-online.target cocoon-cert-refresh.service
+ConditionPathExists=/spec/wireguard-config.json
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=root
+RuntimeDirectory=cocoon-wireguard
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+Environment=AZDCAP_CACHE=/run/cocoon-wireguard
+ExecStartPre=/usr/bin/cocoon-wireguard cleanup --config /spec/wireguard-config.json
+ExecStart=/usr/bin/cocoon-wireguard run --config /spec/wireguard-config.json --membership /run/cluster-membership.json
+ExecStopPost=/usr/bin/cocoon-wireguard cleanup --config /spec/wireguard-config.json
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=125
+TimeoutStopSec=20
+WatchdogSec=10
+KillMode=control-group
+NoNewPrivileges=yes
+LimitCORE=0
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/run/cocoon-wireguard
+PrivateTmp=yes
+# Quote generation can use a host QGS over VM sockets; collateral retrieval may use IPv6.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK AF_VSOCK
+
+[Install]
+WantedBy=multi-user.target

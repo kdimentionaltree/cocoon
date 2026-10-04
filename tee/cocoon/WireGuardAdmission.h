@@ -11,7 +11,7 @@ namespace cocoon::wireguard {
 class Deadline {
  public:
   using Clock = std::chrono::steady_clock;
-  Deadline(Clock::time_point end, std::function<bool()> cancelled = {});
+  Deadline(Clock::time_point end, std::function<bool()> cancelled = {}, std::function<void()> progress = {});
   void check() const;
   void wait(int fd, short events) const;
   Clock::time_point end() const;
@@ -20,6 +20,7 @@ class Deadline {
  private:
   Clock::time_point end_;
   std::function<bool()> cancelled_;
+  std::function<void()> progress_;
 };
 
 struct Evidence {
@@ -52,12 +53,39 @@ std::string admission_reportdata(std::string_view record, bool prover_is_server)
 void check_evidence(const Evidence &evidence, std::string_view expected_reportdata,
                     std::string_view expected_image);
 
+// Exists only inside a freshly verified, still-owned TLS session. It cannot be reconstructed from JSON.
+class AdmittedSession {
+ public:
+  AdmittedSession(const AdmittedSession &) = delete;
+  const Member &peer() const { return peer_; }
+  const Membership &membership() const { return membership_; }
+  bool server() const { return server_; }
+  std::string_view probe_key() const { return probe_key_; }
+  // Both participants must use the same label. progress keeps UDP probes responsive during the barrier.
+  void synchronize(std::string_view label, std::function<void()> progress = {}) const;
+
+ private:
+  friend std::string admit_connected_socket(int, bool, const Config &, const Identity &, std::string_view,
+      std::string_view, EvidenceProvider &, const Deadline &, const std::function<void(const AdmittedSession &)> &);
+  AdmittedSession(const Member &peer, const Membership &membership, bool server, std::string key,
+                  std::function<void(std::string_view, std::function<void()>)> synchronize);
+  ~AdmittedSession();
+  const Member &peer_;
+  const Membership &membership_;
+  bool server_;
+  std::string probe_key_;
+  std::function<void(std::string_view, std::function<void()>)> synchronize_;
+};
+using AfterAdmission = std::function<void(const AdmittedSession &)>;
+
 // Borrows a connected nonblocking socket; all TLS/session state remains owned until return/exception.
 // A successful result records admission only. It is never workload readiness or a reusable admission grant.
 std::string admit_connected_socket(int socket, bool server, const Config &config, const Identity &identity,
                                    std::string_view signed_membership, std::string_view peer_node,
-                                   EvidenceProvider &provider, const Deadline &deadline);
+                                   EvidenceProvider &provider, const Deadline &deadline,
+                                   const AfterAdmission &after_admission = {});
 std::string admit_peer(const Config &config, const Identity &identity, std::string_view signed_membership,
-                       std::string_view peer_node, std::function<bool()> cancelled = {});
+                       std::string_view peer_node, std::function<bool()> cancelled = {},
+                       const AfterAdmission &after_admission = {}, std::function<void()> progress = {});
 
 }  // namespace cocoon::wireguard

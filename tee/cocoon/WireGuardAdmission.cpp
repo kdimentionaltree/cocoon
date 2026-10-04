@@ -154,7 +154,8 @@ Evidence verify_certificate(X509 *certificate, const Config &config, EvidencePro
 
 class Session {
  public:
-  Session(SSL *ssl, int socket, const Deadline &deadline) : ssl_(ssl), socket_(socket), deadline_(deadline) {}
+  Session(SSL *ssl, int socket, const Deadline &deadline, std::function<void()> progress = {})
+      : ssl_(ssl), socket_(socket), deadline_(deadline), progress_(std::move(progress)) {}
 
   void handshake() {
     for (;;) {
@@ -179,7 +180,7 @@ class Session {
     std::array<char, 4> header{};
     transfer(header.data(), header.size(), false);
     auto size = number({header.data(), header.size()});
-    auto limit = expected == 1 ? 137U : expected == 3 ? 33U : max_quote + 1;
+    auto limit = expected == 1 ? 137U : (expected == 3 || expected == 4) ? 33U : max_quote + 1;
     require(size > 1 && size <= limit, "Admission frame size is out of bounds");
     std::string out(static_cast<std::size_t>(size), '\0');
     transfer(out.data(), out.size(), false);
@@ -198,6 +199,7 @@ class Session {
   void transfer(char *data, std::size_t size, bool write) {
     while (size) {
       deadline_.check();
+      if (progress_) progress_();
       std::size_t count = 0;
       ERR_clear_error();
       auto result = write ? SSL_write_ex(ssl_, data, size, &count) : SSL_read_ex(ssl_, data, size, &count);
@@ -208,6 +210,7 @@ class Session {
   SSL *ssl_;
   int socket_;
   const Deadline &deadline_;
+  std::function<void()> progress_;
 };
 
 std::string hello(std::string_view node, std::string_view nonce, std::string_view membership_hash) {
@@ -280,11 +283,16 @@ Fd accept_peer(std::uint16_t port, const Deadline &deadline) {
 
 }  // namespace
 
-Deadline::Deadline(Clock::time_point end, std::function<bool()> cancelled)
-    : end_(end), cancelled_(std::move(cancelled)) {}
+Deadline::Deadline(Clock::time_point end, std::function<bool()> cancelled, std::function<void()> progress)
+    : end_(end), cancelled_(std::move(cancelled)), progress_(std::move(progress)) {}
 void Deadline::check() const {
   require(!cancelled_ || !cancelled_(), "Admission cancelled");
   require(Clock::now() < end_, "Admission deadline exceeded");
+  if (progress_) {
+    progress_();
+    require(!cancelled_ || !cancelled_(), "Admission cancelled");
+    require(Clock::now() < end_, "Admission deadline exceeded");
+  }
 }
 void Deadline::wait(int fd, short events) const {
   for (;;) {
@@ -298,7 +306,7 @@ void Deadline::wait(int fd, short events) const {
 }
 Deadline::Clock::time_point Deadline::end() const { return end_; }
 Deadline Deadline::within(std::chrono::seconds duration) const {
-  return Deadline(std::min(end_, Clock::now() + duration), cancelled_);
+  return Deadline(std::min(end_, Clock::now() + duration), cancelled_, progress_);
 }
 
 std::string admission_record(const Membership &membership, std::string_view client_node,
@@ -337,9 +345,18 @@ void check_evidence(const Evidence &evidence, std::string_view expected_reportda
           "Debug, migration, service-TD, or unsupported TDX attributes are forbidden");
 }
 
+AdmittedSession::AdmittedSession(const Member &peer, const Membership &membership, bool server, std::string key,
+    std::function<void(std::string_view, std::function<void()>)> synchronize)
+    : peer_(peer), membership_(membership), server_(server), probe_key_(std::move(key)), synchronize_(std::move(synchronize)) {}
+AdmittedSession::~AdmittedSession() { OPENSSL_cleanse(probe_key_.data(), probe_key_.size()); }
+void AdmittedSession::synchronize(std::string_view label, std::function<void()> progress) const {
+  synchronize_(label, std::move(progress));
+}
+
 std::string admit_connected_socket(int socket, bool server, const Config &config, const Identity &identity,
                                    std::string_view signed_membership, std::string_view peer_node,
-                                   EvidenceProvider &provider, const Deadline &deadline) {
+                                   EvidenceProvider &provider, const Deadline &deadline,
+                                   const AfterAdmission &after_admission) {
   ErrorQueueGuard error_queue;
   deadline.check();
   auto membership = verify_membership(config, identity, signed_membership, wall_time());
@@ -447,6 +464,32 @@ std::string admit_connected_socket(int socket, bool server, const Config &config
   }
   deadline.check();
   verify_membership(config, identity, signed_membership, wall_time());
+  if (after_admission) {
+    constexpr char probe_label[] = "EXPERIMENTAL-cocoon-wg-probe-v1";
+    std::string key(32, '\0');
+    require(SSL_export_keying_material(ssl.get(), reinterpret_cast<unsigned char *>(key.data()), key.size(),
+        probe_label, sizeof(probe_label) - 1, reinterpret_cast<const unsigned char *>(acceptance.data()),
+        acceptance.size(), 1) == 1, "Cannot derive overlay probe key");
+    AdmittedSession admitted(remote_member, membership, server, std::move(key), [&](std::string_view label,
+                                                                      std::function<void()> progress) {
+      require(!label.empty() && label.size() <= 64, "Invalid setup barrier label");
+      deadline.check();
+      verify_membership(config, identity, signed_membership, wall_time());
+      auto proof = digest(acceptance + std::string("cocoon/wg-setup/v1\0", 19) + std::string(label), EVP_sha256());
+      Session barrier(ssl.get(), socket, deadline, std::move(progress));
+      if (server) {
+        require(barrier.receive(4) == proof, "Peer setup barrier does not match");
+        barrier.send(4, proof);
+      } else {
+        barrier.send(4, proof);
+        require(barrier.receive(4) == proof, "Peer setup barrier does not match");
+      }
+      verify_membership(config, identity, signed_membership, wall_time());
+    });
+    after_admission(admitted);
+    deadline.check();
+    verify_membership(config, identity, signed_membership, wall_time());
+  }
   return nlohmann::json{{"format", "cocoon-wireguard-admission-v1"}, {"status", "peer_admitted"},
                         {"workload_ready", false}, {"peer_node_id", remote_member.node_id},
                         {"peer_boot_id", remote_member.boot_id}, {"peer_overlay_ipv4", remote_member.overlay_ipv4},
@@ -460,18 +503,19 @@ std::string admit_connected_socket(int socket, bool server, const Config &config
 }
 
 std::string admit_peer(const Config &config, const Identity &identity, std::string_view signed_membership,
-                       std::string_view peer_node, std::function<bool()> cancelled) {
+                       std::string_view peer_node, std::function<bool()> cancelled,
+                       const AfterAdmission &after_admission, std::function<void()> progress) {
   auto provider = real_evidence_provider();
   auto peer = std::find_if(config.peers.begin(), config.peers.end(),
                             [&](const auto &p) { return p.node_id == peer_node; });
   require(peer != config.peers.end(), "Peer is not configured");
   verify_membership(config, identity, signed_membership, wall_time());
   Deadline deadline(Deadline::Clock::now() + std::chrono::seconds(config.timeouts.startup_seconds),
-                    std::move(cancelled));
+                    std::move(cancelled), std::move(progress));
   bool server = config.node_rank > peer->node_rank;
   auto socket = server ? accept_peer(config.admission_port, deadline) : connect_peer(*peer, deadline);
   return admit_connected_socket(socket.value, server, config, identity, signed_membership, peer_node,
-                                 *provider, deadline);
+                                 *provider, deadline, after_admission);
 }
 
 }  // namespace cocoon::wireguard

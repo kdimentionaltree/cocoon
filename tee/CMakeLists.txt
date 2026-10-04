@@ -147,8 +147,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
       ${SGX_DCAP_QVL_INCLUDE_DIR} ${TDX_ATTEST_INCLUDE_DIR})
   endif()
 
+  add_library(cocoon_wireguard_device STATIC cocoon/WireGuardDevice.cpp cocoon/WireGuardProbe.cpp
+    cocoon/WireGuardSupervisor.cpp cocoon/WireGuardService.cpp)
+  target_link_libraries(cocoon_wireguard_device PUBLIC cocoon_wireguard_admission PRIVATE
+    nlohmann_json::nlohmann_json ${OPENSSL_CRYPTO_LIBRARY})
+  target_include_directories(cocoon_wireguard_device SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
+
   add_executable(cocoon-wireguard EXCLUDE_FROM_ALL cocoon/wireguard.cpp)
-  target_link_libraries(cocoon-wireguard PRIVATE cocoon_wireguard_admission)
+  target_link_libraries(cocoon-wireguard PRIVATE cocoon_wireguard_device)
   target_include_directories(cocoon-wireguard SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
 
   add_executable(test-wireguard EXCLUDE_FROM_ALL test/wireguard.cpp)
@@ -158,7 +164,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 
   add_executable(test-wireguard-admission EXCLUDE_FROM_ALL test/wireguard-admission.cpp)
   target_link_libraries(test-wireguard-admission PRIVATE
-    cocoon_wireguard_admission cocoon tdactor tdnet_ported ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY}
+    cocoon_wireguard_device cocoon tdactor tdnet_ported ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY}
     nlohmann_json::nlohmann_json)
   target_include_directories(test-wireguard-admission SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
   if(ATTESTATION_AVAILABLE)

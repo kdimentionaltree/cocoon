@@ -1,6 +1,6 @@
-# WireGuard configuration, enrollment, and admission
+# WireGuard service for confidential workers
 
-This implements steps 1 and 2 of the CVM overlay plan: strict configuration, local key generation, public enrollment exports, operator-signed membership, and fresh mutually attested peer admission. `cocoon-wireguard` provides setup commands and a bounded admission command for one configured pair. WireGuard interface configuration and continuous systemd supervision follow in later steps.
+This implements steps 1–4 of the CVM overlay plan: strict configuration, protected local identities, signed membership, fresh mutually attested admission, transactional WireGuard setup, authenticated probes, and continuing lease/liveness supervision. `run` opens workload traffic only after the required group is admitted and healthy, renews admission, and withdraws access on failure. `setup` remains a foreground diagnostic with workload traffic blocked. Guest packaging and opt-in launcher integration are step 5; the unit files here are templates awaiting installation in the guest image.
 
 **An enrollment export is not attestation evidence.** It carries `attestation_status: "not_collected"`. The signing helper authorizes the supplied identities; it does not verify their hardware evidence. `verify-membership` verifies the operator signature, allocation, validity, and local identity, not remote TDX quotes. Live peer admission must independently verify evidence before enabling workload traffic.
 
@@ -13,7 +13,7 @@ build/tee/test-wireguard-admission
 build/tee/cocoon-wireguard --help
 ```
 
-The executable is a Linux target and uses the existing OpenSSL, JSON, and Cocoon dependencies. Building and running the local tests requires no WireGuard tools, networking privileges, or TDX hardware. Actual `admit-peer` execution requires a build with real TDX/DCAP support and confidential guests. Packaging the executable and WireGuard tools into the guest image is a later step.
+The executable is a Linux target and uses the existing OpenSSL, JSON, and Cocoon dependencies. The local tests need ordinary loopback UDP and Unix datagram access but require no elevated networking privileges or TDX hardware. If installed, the `ip` helper is also exercised for read-only link inventory. The application network sandbox may block those operations. Actual `admit-peer`, `setup`, and `run` execution requires real TDX/DCAP support and confidential guests. `cleanup` performs no admission and works without that SDK.
 
 ## Trusted configuration
 
@@ -46,7 +46,7 @@ Both configurations must agree on cluster, workload digest, generation, and memb
 | `keepalive_seconds` | Optional, 0–120; defaults to 25; zero disables keepalive |
 | `timeouts` | Optional complete object; defaults: startup 60s, handshake 15s, lease 300s, renewal 60s, peer 30s |
 
-Handshake timeout cannot exceed startup timeout; renewal and peer deadlines must be shorter than the lease. The parser rejects duplicate/unknown fields, wrong JSON types, duplicate allocations, network/broadcast addresses, invalid encodings, oversized documents, and excessive nesting. It does not inspect live Linux interfaces/routes during step 1; ownership and actual underlay conflicts must be checked before network setup.
+Handshake timeout cannot exceed startup timeout; renewal and peer deadlines must be shorter than the lease. `run` additionally requires `peer_seconds >= 5` for kernel permission timeout margins. The parser rejects duplicate/unknown fields, wrong JSON types, duplicate allocations, network/broadcast addresses, invalid encodings, oversized documents, and excessive nesting. Network startup checks interface ownership and actual underlay conflicts before modifying the device.
 
 ## Generate guest identities
 
@@ -102,7 +102,7 @@ Success prints the decoded public payload. A substituted signer/key/boot, wrong 
 
 ## Admit a pair of confidential guests
 
-Provide each CVM with its own protected configuration, saved same-boot WireGuard identity, the common signed membership, and its Cocoon TDX certificate/key. The certificate files are `<cert_base_name>_cert.pem` and `<cert_base_name>_key.pem`; the private key must be owned by the invoking user with exact mode 0600. Admission reads the current pair for each session, checks that the keys match, and holds that certificate identity stable during the exchange. Certificate changes take effect on the next invocation.
+Provide each CVM with its own protected configuration, saved same-boot WireGuard identity, the common signed membership, and its Cocoon TDX certificate/key. The certificate files are `<cert_base_name>_cert.pem` and `<cert_base_name>_key.pem`; the private key must be owned by the invoking user with exact mode 0600. Admission reads the current pair for each session, checks that the keys match, and holds that certificate identity stable during the exchange. Certificate changes take effect on the next admission, including renewal in `run`; certificate generation/refresh still belongs to Cocoon's existing certificate service.
 
 Run B first, then A, within the configured startup deadline:
 
@@ -122,7 +122,7 @@ cocoon-wireguard admit-peer \
   --output /run/admitted-b.json
 ```
 
-The higher-ranked participant listens; the lower-ranked participant connects. Ensure the host forwards the peer's configured TCP admission endpoint to the guest's `admission_port`. A connection attempt uses bounded exponential backoff from 100ms to 2s. Once connected, certificate or protocol rejection fails the invocation. The listener accepts one session and closes on completion or failure; a multi-peer listener and ongoing renewal belong to supervision in step 4.
+The higher-ranked participant listens; the lower-ranked participant connects. Ensure the host forwards the peer's configured TCP admission endpoint to the guest's `admission_port`. A connection attempt uses bounded exponential backoff from 100ms to 2s. Once connected, certificate or protocol rejection fails the invocation. This diagnostic accepts one session and closes on completion or failure; `run` coordinates successive rank pairs and repeats fresh admission during renewal.
 
 The command performs a full TLS 1.3 handshake using Cocoon's context helper and existing certificate OIDs. Both certificates must be self-signed Ed25519 certificates with exactly one critical TDX quote extension and one critical matching user-claims extension. Missing, duplicate, SEV, unexpected critical, expired, or invalid evidence fails. DCAP verifies the certificate quote without a shared cache; the resulting TLS public key binding, approved image, and platform attributes are checked before the admission exchange proceeds.
 
@@ -148,7 +148,7 @@ The initiator sends its quote first; the responder verifies it before sending it
 
 The total connection/admission work uses the configured startup deadline. TLS establishment also uses the shorter handshake deadline. Nonblocking sockets and separately owned evidence workers allow SIGINT/SIGTERM cancellation. Potentially blocking quote generation and DCAP verification run in an exec'd child with bounded input/output; timeout or cancellation kills and reaps the worker. A worker also requests termination when its parent dies. There is no production fake-verification switch; a build without the real SDK libraries rejects `admit-peer` before creating a listener or identity.
 
-Success prints public JSON with `status: "peer_admitted"`, the verified peer key/boot/image, evidence and transcript hashes, membership generation, and expiry. **This is a diagnostic result of that session, not a reusable authorization token or proof of continuing connectivity.** `workload_ready` remains false. The command does not create an interface, install a WireGuard peer, or continuously enforce a lease. The next steps must consume admission in a supervised process and perform network probes before enabling workload traffic.
+Success prints public JSON with `status: "peer_admitted"`, the verified peer key/boot/image, evidence and transcript hashes, membership generation, and expiry. **This is a diagnostic result of that session, not a reusable authorization token or proof of continuing connectivity.** `workload_ready` remains false. The command does not create an interface, install a WireGuard peer, or continuously enforce a lease. `run` consumes the live admission capability and performs network probes before enabling workload traffic.
 
 Local tests use synthetic evidence strictly inside the separate test executable. They cover real TLS exchanges, replay and context changes, certificate rejection, frame bounds, expiry, and cancellation/cleanup of a blocked verifier. They do not demonstrate genuine quote generation or successful DCAP verification. Before CVM deployment, build with the actual TDX/DCAP libraries and test this sequence on two approved guests, including substituted keys, old quotes, expired membership, and guest restart. The wall-clock and VM-suspension assumptions described above still apply.
 
@@ -184,3 +184,99 @@ Run the complete CLI integration test, including independent OpenSSL signature v
 ```bash
 python3 tee/test/wireguard-cli.py build/tee/cocoon-wireguard
 ```
+
+## Set up and probe the overlay (step 3)
+
+Run this in each CVM, using that node's configuration and the same current signed membership:
+
+```bash
+cocoon-wireguard setup \
+  --config /spec/wireguard-config.json \
+  --membership /run/cluster-membership.json
+```
+
+The command runs in the foreground; start it on every configured rank during the startup window. Both ends must run `setup` for the install/probe barriers. `admit-peer` remains an admission-only diagnostic. All configured peers are required by `setup`, including entries marked `required: false`; `run` implements optional-peer handling.
+
+Guest prerequisites are the kernel WireGuard module, network administration privileges, `/usr/sbin/ip`, `/usr/bin/wg`, and `/usr/sbin/nft`. UDP `listen_port` carries encrypted WireGuard packets, and TCP `admission_port` carries attested admission. Overlay UDP **51822** and **51823** are reserved for probes and heartbeats on every node; `listen_port` must differ from both. Neither control port needs an underlay/host mapping because both travel inside WireGuard. Host UDP mappings and the admission TCP mappings still need to be reachable.
+
+Setup first checks live addresses and routes across routing tables for overlay overlap, checks underlay endpoint routes, and refuses to adopt an existing interface. It installs a closed firewall gate before creating its own interface. The interface has an ownership alias, the configured MTU, and the local overlay address as a `/32`. Each peer receives exactly its signed key, configured endpoint/keepalive, an `AllowedIPs` `/32`, and a separate Linux `/32` route **inside its freshly admitted TLS session**. Public admission JSON cannot be supplied as a setup grant. `wg` configures peers; `ip` configures links, addresses and routes. [WireGuard tool manual](https://git.zx2c4.com/wireguard-tools/about/src/man/wg.8).
+
+The private key stays under the enrollment lock and reaches `wg` through a sealed, owner-only anonymous descriptor. Helpers receive fixed executable paths and explicit argument arrays, with no shell, unrelated inherited descriptors, or private key arguments. Their execution and output are bounded; helper diagnostics that might contain key material are not printed.
+
+The retained firewall table is `inet cwg_<interface>`, for example `inet cwg_wg0`. Its input/output chains permit the two control UDP ports between exact local/peer addresses through the intended interface. Ordinary workload rules require membership in the timed `active_peers` and `ready_node` sets; `setup` leaves both empty. Remaining overlay source/destination traffic is dropped, preventing plaintext fallback to another interface. The forward chain always drops overlay traffic, including forwarded container packets: workloads currently need the guest's host network namespace, such as container host networking. There is no broad connection-tracking exemption. The service neither flushes the global ruleset nor overrides another table. A retained gate is reused only when its complete static rules match; only the exact previous step-3 closed gate can be upgraded, atomically. Existing firewall policy can still prevent traffic. These rules use nftables' structured JSON interface. [nftables JSON reference](https://manpages.debian.org/trixie/libnftables1/libnftables-json.5.en.html).
+
+After installation, both nodes exchange fresh challenges through connected UDP sockets bound to the WireGuard interface and local overlay address. HMAC-SHA256 uses a separate TLS exporter key tied to this admission transcript. Both directions must authenticate; malformed, reflected, stale or unauthenticated traffic cannot establish connectivity. Probe datagrams fill the configured inner IPv4 MTU and prohibit inner fragmentation. Retransmissions continue during a final TLS barrier, so packet loss does not turn a historical handshake into a successful connectivity result. A common rank-pair ordering coordinates meshes with more than two nodes.
+
+Success prints a diagnostic snapshot with `status: "overlay_probed"`, public peer admission records, generation and expiry, and **`workload_ready: false`**. The gate remains closed. `--output FILE` writes the same snapshot exclusively; use a fresh path on each run. This file does not represent ongoing liveness or authorize workloads. Do not launch multinode inference from this status yet.
+
+The command holds the device for at most the remaining signed lease using a monotonic deadline, also checking wall-clock expiry. It performs no renewal and no continuing peer liveness checks. SIGINT/SIGTERM, startup failure, probe failure, or lease expiry removes the owned interface, its routes and kernel peers while retaining the closed firewall. Lease expiry exits unsuccessfully; a signal after successful setup exits successfully. Cleanup checks the interface ownership alias, including when a helper times out after creating it.
+
+A forced kill can leave the kernel interface and peers behind. `setup`'s retained gate still blocks workload traffic, and restart refuses to adopt that interface. Use `cleanup` below before restarting. Changing interface/CIDR/peer configuration requires explicitly reconciling retained gates; incompatible or modified guards are refused.
+
+## Supervise and activate workloads (step 4)
+
+Start `run` on every configured CVM during the startup window, using the same signed membership. Use one service process per enrolled identity; its lock prevents concurrent setup, enrollment mutation, or cleanup.
+
+```bash
+cocoon-wireguard run \
+  --config /spec/wireguard-config.json \
+  --membership /run/cluster-membership.json
+```
+
+Startup installs the closed guard and owned device, then admits and probes peers in a common rank-pair order. A single startup deadline covers setup, all initial admissions, and required-group readiness. Required-peer failure stops the service. An unavailable optional peer gets a bounded admission attempt and remains absent; an expired optional peer is removed from the kernel. At least one admitted, healthy peer is necessary even if all entries are optional.
+
+Freshly admitted peers exchange authenticated challenges over overlay UDP 51823 once a second. The heartbeat key is derived from the live admission's exporter key using a separate HMAC domain, `cocoon/wg-heartbeat-key/v1` followed by NUL. Requests do not refresh liveness. Only an authenticated acknowledgment of an outstanding challenge counts, once, and its deadline starts when that challenge was issued. Delayed, reflected, previous-session, forged, and replayed packets cannot extend authorization. Each acknowledgment also reports whether the remote worker has completed its configured admission round. Required peers must report that state before workload access opens.
+
+When ready, the service atomically refreshes nftables set elements every 500ms. Each peer permission ends at its signed lease or liveness bound; the local readiness element ends at the earliest required-peer or local lease bound. Integer nftables JSON timeouts are seconds. Permissions subtract a two-second helper/polling margin and round down, so access may close up to roughly three seconds early. Updates have a one-second helper deadline. Kernel element expiry removes permissions without waiting for userspace cleanup; a killed or stuck service cannot keep refreshing them. The outer WireGuard interface may remain until cleanup, but ordinary workload packets still lose their permission. [nftables element timeouts](https://wiki.nftables.org/wiki-nftables/index.php/Element_timeouts).
+
+Every second the ready service checks its interface ownership, UP state and MTU, exact installed peer keys/`AllowedIPs`, and static firewall rules. Authenticated heartbeats run while admission and evidence helpers wait, including renewal. Interface loss, changed inventory, required-peer expiry, bad renewal, or an invalid membership file closes the gate and stops the service. SIGINT/SIGTERM performs the same teardown and returns successfully. Other failures exit unsuccessfully.
+
+### Renew a signed lease
+
+Supply a new correctly signed grant before the current lease expires. Keep the same cluster, workload, generation, allocation, image, boot identities and WireGuard keys; increase `expires_at` and do not decrease `not_before`. The new validity interval must still fit `timeouts.lease_seconds`. Sign to a new filename, then atomically rename that completed envelope over `/run/cluster-membership.json` on each guest. Never rewrite the file in place: a partial or invalid file causes immediate withdrawal.
+
+The service detects a changed grant and performs fresh mutual attestation and an MTU probe for every peer. Healthy existing traffic remains bounded by each peer's previous authorization until that peer completes admission under the new grant. Re-reading an unchanged grant never extends its monotonic expiry. Even without a changed grant, `renewal_seconds` schedules fresh reattestation; it cannot extend the operator's lease. Current certificate files are loaded again for each admission.
+
+This first implementation requires coordinated grant delivery and renewal rounds across workers. A peer with a different membership digest rejects the admission; distribute the same grant to all ranks within their renewal window. There is no controller, staged two-grant protocol, or distributed agreement service yet. New member boot/key/image identities or a new generation require stopping the group, updating its protected configuration/membership as appropriate, and restarting through enrollment. An expired or rolled-back grant is rejected.
+
+Wall time must be trustworthy when validating a grant, certificate and collateral. Within a running process, steady-clock deadlines prevent repeated grant reads or a wall-clock rollback from extending the anchored lease. Kernel timeout enforcement assumes guest timers progress and helper execution stays within the stated budget. VM suspension, full snapshot restore, host-controlled time, and replay across process restarts require a trusted time/epoch or controller design; local supervision does not provide complete rollback resistance. Guest root, the measured code/policy and firewall remain trusted.
+
+### Status, systemd readiness and recovery
+
+`run` atomically writes `<state-dir>/status.json` (default `/run/cocoon-wireguard/status.json`) with exact mode 0600 in the private directory. It contains public peer keys/boot IDs/measurements, state, generation, membership digest, lease expiry, heartbeat age and rejection reasons. Private keys and heartbeat secrets are never persisted in status. Stdout emits status on phase/readiness changes; the file refreshes about once a second. **Status is a diagnostic snapshot, not an authorization token or proof that the daemon is still alive.**
+
+The [service template](systemd/cocoon-wireguard.service) uses `Type=notify`, a ten-second watchdog, cleanup before start and after stop, and the protected runtime directory. `READY=1` is sent only after required peers are healthy and kernel workload permissions are installed. Failure sends `STOPPING=1`, closes workload permissions, and removes the owned interface. systemd has no `READY=0` withdrawal protocol; service termination and a [consumer dependency](systemd/workload-dependency.conf.example) provide the stop contract. [systemd notifications](https://manpages.debian.org/trixie/libsystemd-dev/sd_notify.3.en.html).
+
+The template allows VM sockets for TDX quote generation and IPv6 for collateral retrieval, although overlay peers remain IPv4. Intel's quote library can use a host QGS through `AF_VSOCK`; blocking that family would prevent that attestation path. It places the DCAP cache under the protected runtime directory using `AZDCAP_CACHE`, which Intel's provider supports. [Intel quote transport](https://raw.githubusercontent.com/intel/confidential-computing.tee.dcap/main/QuoteGeneration/quote_wrapper/tdx_attest/tdx_attest.c), [Intel collateral cache configuration](https://github.com/intel/confidential-computing.tee.dcap/blob/main/QuoteGeneration/qcnl/linux/sgx_default_qcnl.conf).
+
+Install the dependency example as a drop-in for the actual inference service:
+
+```ini
+[Unit]
+BindsTo=cocoon-wireguard.service
+After=cocoon-wireguard.service
+```
+
+`After` waits for notification readiness; `BindsTo` stops a consumer when the overlay service becomes unavailable. The template retries a failed overlay service with bounded start-rate limits. It does not automatically relaunch a stopped inference group: after the overlay becomes ready again, explicitly restart the bound consumers or have the future job supervisor restart all ranks together. Start/enable commands and image installation are deferred to step 5. If `startup_seconds` exceeds the unit's 125-second start timeout, adjust `TimeoutStartSec` to cover the startup and cleanup budget. Avoid adding `After=spec.service` when `/spec/init` synchronously starts the overlay, which would create an ordering cycle.
+
+For crash recovery or a stopped diagnostic setup:
+
+```bash
+cocoon-wireguard cleanup --config /spec/wireguard-config.json
+```
+
+Cleanup acquires the saved identity lock before changing a live service's permissions, verifies/reinstalls the exact closed guard, clears timed sets, deletes only the interface with the enrolled ownership alias, and records stopped/unready status. It is idempotent and does not generate a missing enrollment key. Foreign interface ownership or incompatible firewall state is rejected, requiring administrator reconciliation. The retained fallback guards stay in place. Run cleanup with the same protected configuration and state directory; preserve the same-boot identity while restarting.
+
+## Kernel integration test
+
+The local admission test includes synthetic-evidence admission, sealed-key ownership, command failure injection before/after mutations, route/interface conflicts, retained-gate validation/upgrade, peer rollback, and real loopback UDP probes at MTUs 1280, 1400 and 1420. It also checks packet loss and probe/heartbeat replay, delayed/out-of-order heartbeat handling, monotonic expiry, lease extension binding, optional-peer removal decisions, timed gate transactions, atomic status, notification/watchdog messages, ownership-safe crash cleanup, and teardown after gate failure. Synthetic evidence appears only in the test executable; production admission/setup/run has no fake attestation switch.
+
+On a Linux test machine with root, network/mount namespace support, nftables, and a WireGuard-capable kernel:
+
+```bash
+sudo python3 tee/test/wireguard-network.py build/tee/test-wireguard-admission
+```
+
+The harness creates an outer network namespace and private mount namespace, then two worker namespaces connected by a veth pair. It checks real kernel WireGuard setup, the authenticated MTU probe, closed-gate blocking, authorized ordinary workload UDP, automatic kernel permission expiry while the interface stays up, cleanup/restart, and interface-loss detection. Its veth links never enter the host network namespace; `/run/netns` exists in a private temporary mount. Attestation is synthetic in this harness. A non-root invocation exits 77 with a skip explanation.
+
+This workspace cannot create the required namespaces, including outside the application sandbox. The kernel integration harness has not been run here. Real TDX/DCAP admission and encrypted traffic between two actual CVMs still require hardware validation before enabling workloads.

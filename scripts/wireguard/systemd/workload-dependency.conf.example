@@ -1,0 +1,4 @@
+# Install as a drop-in for the actual inference service, e.g. vllm.service.d/20-wireguard.conf.
+[Unit]
+BindsTo=cocoon-wireguard.service
+After=cocoon-wireguard.service
