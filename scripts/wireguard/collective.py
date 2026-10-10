@@ -45,10 +45,11 @@ def transport_environment(interface):
 def make_store(dist, config, leader, port, timeout):
     if config['node_rank'] != 0:
         return dist.TCPStore(leader, port, 2, False, timedelta(seconds=timeout), use_libuv=False)
-    # PyTorch's ordinary TCP rendezvous may listen on all addresses. Hand it an overlay-bound fd instead.
+    # TCPStore also connects locally to its own listener. Bind its exact overlay address;
+    # SO_BINDTODEVICE would exclude that loopback connection. The readiness gate admits
+    # local self traffic only while the group is ready and still rejects underlay ingress.
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, config['interface'].encode() + b'\0')
         sock.bind((config['overlay_ipv4'], port))
         sock.listen(2)
         fd = sock.detach()

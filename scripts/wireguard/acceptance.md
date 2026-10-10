@@ -2,7 +2,7 @@
 
 Use this procedure on two dedicated Intel TDX workers before loading a distributed model. It tests the production admission/service path, ordinary application traffic and collective transport. It does not implement distributed SGLang/vLLM rank launch or turn diagnostic JSON into externally verifiable cluster evidence.
 
-The tooling is implemented and locally tested. **The full new image build/boot, kernel namespace harness and actual two-CVM run remain pending.** Record those separately; loopback tests with synthetic evidence cannot satisfy hardware acceptance.
+The tooling is implemented and locally tested. A debug image has now been built and booted on two non-TEE hosts; signed fake-TEE admission, bidirectional TCP/UDP and GPU inference over the overlay pass. The isolated kernel namespace harness also passes. **Real TDX admission and hardware acceptance remain pending.** Synthetic evidence cannot satisfy hardware acceptance.
 
 ## Build and prepare
 
@@ -103,12 +103,12 @@ docker run --rm --network=host --ipc=host --gpus all --entrypoint=python3 \
   -v /usr/share/cocoon/wireguard-collective.py:/test.py:ro \
   -v /run/spec/wireguard-config.json:/config.json:ro \
   "$IMAGE" /test.py --config /config.json --backend nccl \
-  --port 29500 --seconds 90 > /run/cocoon-wireguard-acceptance/nccl.log 2>&1
+  --port 29502 --seconds 90 > /run/cocoon-wireguard-acceptance/nccl.log 2>&1
 ```
 
-The script derives rank and leader overlay address from the two-worker configuration. It fixes Gloo to the interface and NCCL to the exact interface, Socket transport and IPv4, disables InfiniBand and separate NCCL OOB network selection, and emits initialization/network logs. Check both logs for successful results and the expected `NET/Socket` transport/interface. A configured environment alone is not observed transport evidence. [NCCL transport/interface options](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html).
+Use separate rendezvous ports for successive tests so TCP sockets still closing from one test do not prevent the next listener from binding. The script derives rank and leader overlay address from the two-worker configuration. It fixes Gloo to the interface and NCCL to the exact interface, Socket transport and IPv4, disables InfiniBand and separate NCCL OOB network selection, and emits initialization/network logs. Check both logs for successful results and the expected `NET/Socket` transport/interface. A configured environment alone is not observed transport evidence. [NCCL transport/interface options](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html).
 
-The rank-0 rendezvous listener is also bound to its overlay address/device: the script passes that listener's descriptor to `TCPStore` with `use_libuv=False`. This avoids an all-address rendezvous listener. The inference image must support these PyTorch arguments; an unsupported backend/API fails the test. [PyTorch TCPStore](https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.TCPStore).
+The rank-0 rendezvous listener binds only its exact overlay address: the script passes that listener's descriptor to `TCPStore` with `use_libuv=False`. It omits `SO_BINDTODEVICE` because TCPStore must also connect locally to its own listener through loopback. The overlay gate permits that exact local self traffic only while the group is ready and still rejects underlay ingress. The inference image must support these PyTorch arguments; an unsupported backend/API fails the test. [PyTorch TCPStore](https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.TCPStore).
 
 Both ranks all-reduce float tensors at three sizes and verify **every element equals 3**. The parent enforces a hard whole-process deadline covering import, initialization, collectives and shutdown. Keep renewing the same approved lease during these checks. They test one GPU per guest; intra-guest multi-GPU topology and full model parallelism are separate acceptance tests.
 
@@ -172,22 +172,22 @@ On a separate Linux test machine with the required privileges and kernel support
 sudo python3 tee/test/wireguard-network.py build/tee/test-wireguard-admission
 ```
 
-This confines devices and policy to isolated namespaces and uses synthetic attestation. Namespace creation is unavailable in the current workspace, including outside its application sandbox. A full image build was attempted with the project's mkosi 26~devel virtual environment and separate `/tmp` output/cache/workspace paths. It failed at namespace creation (`Operation not permitted`), before package installation or image construction, including outside the application sandbox. Existing guest images were not replaced. Guest boot and live admission also require a TDX host; this workspace has no TDX/KVM devices.
+This confines devices and policy to isolated namespaces and uses synthetic attestation. It now passes with elevated privileges on the development host, including expiring permissions for local overlay self traffic. Full debug image builds and two non-TEE guest boots also succeed. The application's default network sandbox still restricts these operations. Real-mode admission continues to require a TDX host; fake-mode guest results are recorded separately.
 
 Maintain one ledger per deployment:
 
 | Evidence | Current workspace status | Deployment result to record |
 | --- | --- | --- |
-| Native enrollment and admission/device/probe/supervisor/gate tests | Passed: 445 and 1,049 assertions | Binary/build identity and output |
+| Native enrollment and admission/device/probe/supervisor/gate tests | Earlier enrollment suite passed; current admission suite passed 1,229 assertions | Binary/build identity and output |
 | CLI signature checks | Passed: 34 commands, independent OpenSSL verification | Output |
-| Guest/launcher install/integration tests | Passed: 13 tests | Output |
-| Acceptance tooling tests | Passed: 16 tests, including local TCP/UDP | Output |
+| Guest/launcher install/integration tests | Passed: 18 tests | Output |
+| Acceptance tooling tests | Passed: 17 tests, including local TCP/UDP and rendezvous self connection | Output |
 | General `test-cocoon` target | Cannot compile: pre-existing obsolete header/API references | Repair/migrate that target separately |
-| Complete new mkosi image and TDX boot | Blocked locally by namespace creation; no new image built | Image/spec measurements and boot logs |
-| Isolated kernel packet harness | Pending | Output and kernel version |
-| Production two-CVM admission and bidirectional traffic | Pending | Both reports, matching grant, traffic outputs and underlay observations |
+| Complete new mkosi image and TDX boot | Debug image build and two non-TEE boots passed; TDX boot pending | Image/spec measurements and boot logs |
+| Isolated kernel packet harness | Passed with real kernel WireGuard and synthetic attestation | Output and kernel version |
+| Production two-CVM admission and bidirectional traffic | Fake-TEE signed admission, bidirectional TCP/UDP and GPU inference passed; TDX and underlay captures pending | Both reports, matching grant, traffic outputs and underlay observations |
 | Failure/rejection/recovery matrix | Pending on actual workers | Intervention, timed observations, consumer state and recovery |
-| Gloo and GPU NCCL collectives | Pending; PyTorch/GPU runtime unavailable locally | Both logs, exact image digest, Socket transport and correct results |
+| Gloo and GPU NCCL collectives | Passed on both fake-TEE guests, nine all-reduces per rank/backend; NCCL logs confirm Socket transport on wg0 | Both logs, exact image digest, Socket transport and correct results |
 | Distributed SGLang/vLLM serving | Outside the first overlay service; pending | Approved rank launch, cluster serving identity and coherent restart tests |
 
 Complete hardware acceptance only after the intended CVMs pass the applicable live rows. Keep external approval of final images and the limitations of status/public enrollment explicit in the result.

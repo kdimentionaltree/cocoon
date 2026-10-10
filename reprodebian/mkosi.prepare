@@ -30,8 +30,9 @@ if [[ "$1" == "final" ]]; then
   fi
   WG_RETAINED="$(python3 "$SRCDIR/pkg-aux/wireguard-modules.py" "$BUILDROOT/lib/modules/$KERNEL_VERSION")"
   test "$WG_RETAINED" = "$(cat "$WG_MODULES")"
-  mkosi-chroot modprobe --set-version "$KERNEL_VERSION" --show-depends --ignore-install wireguard
-  mkosi-chroot modprobe --set-version "$KERNEL_VERSION" --show-depends --ignore-install nf_tables
+  for WG_MODULE in wireguard nf_tables nft_compat xt_comment; do
+    mkosi-chroot modprobe --set-version "$KERNEL_VERSION" --show-depends --ignore-install "$WG_MODULE"
+  done
   rm -f "$WG_MODULES" "$WG_ALLOWLIST"
   trap - EXIT
 

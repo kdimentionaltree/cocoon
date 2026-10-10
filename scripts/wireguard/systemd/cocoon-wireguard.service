@@ -33,5 +33,5 @@ PrivateTmp=yes
 # Quote generation can use a host QGS over VM sockets; collateral retrieval may use IPv6.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK AF_VSOCK
 
-[Install]
-WantedBy=multi-user.target
+# Specialization starts this static unit after preparing the measured configuration.
+# An install target would let image presets start it concurrently with spec.service.

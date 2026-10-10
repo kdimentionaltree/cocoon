@@ -98,6 +98,8 @@ Identity load_or_create_identity(const Config &config, const std::string &state_
 
 std::string read_public_file(const std::string &path);
 std::string read_private_file(const std::string &path);
+// Cocoon's certificate generator emits owner-only read-only keys (0400).
+std::string read_tls_private_key_file(const std::string &path);
 void write_public_file(const std::string &path, std::string_view content);
 
 // Raw X25519 private bytes in, canonical WireGuard public key out. No private bytes are exported.

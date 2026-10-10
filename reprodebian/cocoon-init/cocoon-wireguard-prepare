@@ -144,8 +144,8 @@ def prepare_network(config):
         raise ValueError('Supervision requires peer_seconds >= 5')
     if config['listen_port'] in (51822, 51823) or config['admission_port'] == 8000:
         raise ValueError('Configured port conflicts with overlay control or inference')
-    run(['/usr/sbin/modprobe', 'wireguard'])
-    run(['/usr/sbin/modprobe', 'nf_tables'])
+    for module in ('wireguard', 'nf_tables', 'nft_compat', 'xt_comment'):
+        run(['/usr/sbin/modprobe', module])
     # The independent nftables drops must exist before the base INPUT policy permits wg traffic.
     run(wireguard_command('cleanup', config))
     firewall(config)

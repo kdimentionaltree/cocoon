@@ -218,6 +218,30 @@ void policy_tests() {
   check(cocoon::validate_proxy_config(config).is_error(), "Unknown router policy was not rejected");
 }
 
+void tls_key_permissions_tests() {
+  TemporaryDirectory directory;
+  auto path = directory.path + "/key.pem";
+  wg::write_public_file(path, "fixture key");
+  for (auto mode : {0400, 0600}) {
+    check(chmod(path.c_str(), mode) == 0, "Cannot set TLS key permissions");
+    check(wg::read_tls_private_key_file(path) == "fixture key", "Owner-only TLS key was rejected");
+  }
+  check(wg::read_private_file(path) == "fixture key", "Strict private file reader changed");
+  for (auto mode : {0000, 0200, 0500, 0640, 0644, 0604, 0700, 04600}) {
+    check(chmod(path.c_str(), mode) == 0, "Cannot set invalid TLS key permissions");
+    rejected([&] { wg::read_tls_private_key_file(path); });
+  }
+  check(chmod(path.c_str(), 0400) == 0, "Cannot restore TLS key permissions");
+  rejected([&] { wg::read_private_file(path); });  // Runtime state and signing keys still require 0600.
+  auto alias = directory.path + "/alias.pem";
+  check(link(path.c_str(), alias.c_str()) == 0, "Cannot create hard-linked TLS key fixture");
+  rejected([&] { wg::read_tls_private_key_file(path); });
+  check(unlink(alias.c_str()) == 0 && symlink(path.c_str(), alias.c_str()) == 0,
+        "Cannot create symlinked TLS key fixture");
+  rejected([&] { wg::read_tls_private_key_file(alias); });
+  rejected([&] { wg::read_tls_private_key_file(directory.path); });
+}
+
 void transcript_tests(Fixture &fixture) {
   auto m = fixture.membership;
   auto make_record = [&](const wg::Membership &input, std::string n = std::string(32, 'c'),
@@ -310,6 +334,70 @@ std::string paired_session(Fixture &fixture, bool success, bool corrupt = false,
   return provider.generated;
 }
 
+void handshake_transport_retry_tests(Fixture &fixture) {
+  for (unsigned mode = 0; mode < 3; ++mode) {
+    int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    check(listener >= 0, "Cannot create transient admission listener");
+    timeval timeout{5, 0};
+    check(setsockopt(listener, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0,
+          "Cannot bound transient admission fixture");
+    sockaddr_in address{};
+    address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    check(bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0 && listen(listener, 4) == 0,
+          "Cannot bind transient admission listener");
+    socklen_t size = sizeof(address);
+    check(getsockname(listener, reinterpret_cast<sockaddr *>(&address), &size) == 0,
+          "Cannot inspect transient admission port");
+    auto config = fixture.a;
+    config.peers[0].endpoint_ipv4 = "127.0.0.1";
+    config.peers[0].admission_endpoint_port = ntohs(address.sin_port);
+    config.timeouts.startup_seconds = 4; config.timeouts.handshake_seconds = 2;
+    bool expected = mode != 2;
+    std::cout.flush();
+    auto child = fork();
+    check(child >= 0, "Cannot start transient admission fixture");
+    if (child == 0) {
+      auto first = accept4(listener, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
+      if (first < 0) _exit(2);
+      if (mode == 1) shutdown(first, SHUT_RDWR);
+      else {
+        linger reset{1, 0};
+        if (setsockopt(first, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset)) != 0) _exit(2);
+      }
+      close(first);  // Model a VM port forward before the guest listener is ready.
+      auto second = accept4(listener, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
+      if (second < 0) _exit(2);
+      bool admitted = false;
+      try {
+        FixtureEvidence provider;
+        provider.fake = wg::evidence_provider(fixture.b);
+        provider.corrupt_report = !expected;
+        auto result = wg::admit_connected_socket(second, true, fixture.b, fixture.identity_b,
+            fixture.envelope, "a", provider,
+            wg::Deadline(wg::Deadline::Clock::now() + std::chrono::seconds(3)));
+        admitted = Json::parse(result).at("status") == "peer_admitted";
+      } catch (const wg::Error &) {}
+      close(second); close(listener);
+      _exit(admitted == expected ? 0 : 1);
+    }
+    close(listener);
+    auto start = wg::Deadline::Clock::now();
+    bool admitted = false;
+    try {
+      admitted = Json::parse(wg::admit_peer(config, fixture.identity_a, fixture.envelope, "b")).at("status") ==
+                 "peer_admitted";
+    } catch (const wg::Error &error) {
+      if (expected) std::cerr << "Unexpected retry failure: " << error.what() << '\n';
+    }
+    int result = 0;
+    check(waitpid(child, &result, 0) == child && WIFEXITED(result) && WEXITSTATUS(result) == 0,
+          "Transient admission fixture had an unexpected result");
+    check(admitted == expected, "Handshake transport reset was not retried, or invalid evidence was accepted");
+    check(wg::Deadline::Clock::now() - start < std::chrono::seconds(3),
+          "Transport retry exceeded bounds or retried an attestation rejection");
+  }
+}
+
 void fake_tee_tests() {
   for (unsigned combination = 0; combination < 3; ++combination) {
     Fixture fixture;
@@ -327,7 +415,7 @@ void fake_tee_tests() {
       for (const auto &suffix : {"_cert.pem", "_key.pem"}) std::filesystem::remove(config.cert_base_name + suffix);
       wg::write_public_file(config.cert_base_name + "_cert.pem", cert.cert_pem());
       wg::write_public_file(config.cert_base_name + "_key.pem", cert.key_pem());
-      chmod((config.cert_base_name + "_key.pem").c_str(), 0600);
+      chmod((config.cert_base_name + "_key.pem").c_str(), 0400);
       auto &member = fixture.membership.members[i];
       member.boot_id = identity.boot_id; member.wireguard_public_key_b64 = identity.wireguard_public_key_b64;
       member.image_hash_hex = td::hex_encode(tee->make_report(td::UInt512{}).move_as_ok().image_hash().as_slice());
@@ -342,6 +430,7 @@ void fake_tee_tests() {
       check(wg::admission_supported(config), "SDK-free fake admission unavailable");
     }
     fixture.envelope = wg::sign_membership(fixture.membership, fixture.signer);
+    if (combination == 0) handshake_transport_retry_tests(fixture);
     auto quote = paired_session(fixture, true);
     paired_session(fixture, false, true); // Fresh synthetic REPORTDATA still binds the challenge.
     paired_session(fixture, false, false, true);
@@ -403,6 +492,7 @@ class FakeNetworkCommands final : public wg::NetworkCommands {
   std::string public_key;
   unsigned mutations = 0, fail_mutation = 0;
   bool fail_after_effect = false;
+  bool ignore_creation_alias = false;
 
   std::string run(wg::NetworkTool tool, const std::vector<std::string> &args, std::string_view input,
                   int key_fd, const wg::Deadline &deadline) override {
@@ -445,6 +535,9 @@ class FakeNetworkCommands final : public wg::NetworkCommands {
     } else if (tool == wg::NetworkTool::Ip && has("link") && has("add")) {
       auto alias = std::find(args.begin(), args.end(), "alias");
       links.push_back({{"ifname", args[3]}, {"ifalias", *(alias + 1)}, {"mtu", 1420}, {"flags", Json::array()}});
+      if (ignore_creation_alias) links.back().erase("ifalias");
+    } else if (tool == wg::NetworkTool::Ip && has("link") && has("set") && has("alias")) {
+      links.back()["ifalias"] = *(std::find(args.begin(), args.end(), "alias") + 1);
     } else if (tool == wg::NetworkTool::Ip && has("link") && has("delete")) {
       links.erase(std::remove_if(links.begin(), links.end(), [&](const Json &link) { return link.at("ifname") == args[3]; }), links.end());
       kernel_peers.clear();
@@ -479,6 +572,27 @@ void device_tests(Fixture &fixture) {
     rejected([&] { real->run(wg::NetworkTool::Ip, {"--invalid-cocoon-test-option"}, {}, -1, device_deadline()); });
     check(waitpid(-1, nullptr, WNOHANG) < 0 && errno == ECHILD, "Network helper was not reaped");
   }
+  if (access("/usr/sbin/nft", X_OK) == 0) {
+    std::string diagnostic;
+    try {
+      real->run(wg::NetworkTool::Nftables, {"--invalid-cocoon-test-option"}, {}, -1, device_deadline());
+    } catch (const wg::Error &error) { diagnostic = error.what(); }
+    check(diagnostic.find("Guest network helper failed: /usr/sbin/nft (exit ") == 0 &&
+        diagnostic.find("--invalid-cocoon-test-option") != std::string::npos,
+        "Failed nftables helper concealed its diagnostic");
+    check(diagnostic.size() < 4200 && std::none_of(diagnostic.begin(), diagnostic.end(), [](unsigned char byte) {
+      return byte < 32 || byte == 127;
+    }), "Helper diagnostic was not bounded and safe for one-line logs");
+  }
+  if (access("/usr/bin/wg", X_OK) == 0) {
+    std::string diagnostic;
+    try {
+      real->run(wg::NetworkTool::WireGuard, {"--invalid-cocoon-private-key-marker"}, {}, -1, device_deadline());
+    } catch (const wg::Error &error) { diagnostic = error.what(); }
+    check(diagnostic.find("Guest network helper failed: /usr/bin/wg (exit ") == 0 &&
+        diagnostic.find("private-key-marker") == std::string::npos,
+        "Failed WireGuard helper exposed its diagnostic");
+  }
   {
     wg::RuntimeIdentity identity(fixture.a, fixture.directory.path + "/state-a");
     check(identity.identity().wireguard_public_key_b64 == fixture.identity_a.wireguard_public_key_b64,
@@ -491,7 +605,7 @@ void device_tests(Fixture &fixture) {
     rejected([&] { wg::load_or_create_identity(fixture.a, fixture.directory.path + "/state-a"); });
     // Fail before and after each setup mutation; a created but timed-out link must also be removed.
     for (bool after : {false, true}) {
-      for (unsigned step = 1; step <= 5; ++step) {
+      for (unsigned step = 1; step <= 6; ++step) {
         FakeNetworkCommands commands;
         commands.public_key = fixture.identity_a.wireguard_public_key_b64;
         commands.fail_mutation = step; commands.fail_after_effect = after;
@@ -519,6 +633,16 @@ void device_tests(Fixture &fixture) {
     auto previous = commands.mutations;
     device.stop(device_deadline());
     check(commands.mutations == previous, "Cleanup is not idempotent");
+    // Match kernels that discard the creation-time alias. Ownership must still be
+    // installed before key configuration, and the interface must remain removable.
+    FakeNetworkCommands no_create_alias;
+    no_create_alias.public_key = fixture.identity_a.wireguard_public_key_b64;
+    no_create_alias.ignore_creation_alias = true;
+    wg::WireGuardDevice explicitly_owned(fixture.a, no_create_alias);
+    explicitly_owned.start(identity, device_deadline());
+    explicitly_owned.check_inventory(device_deadline());
+    explicitly_owned.stop(device_deadline());
+    check(no_create_alias.links.size() == 1, "Kernel ignoring creation-time alias prevented owned cleanup");
     auto inventory = Json::parse(wg::inspect_guard(fixture.a, commands, device_deadline()));
     check(inventory.at("nftables") == commands.firewall, "Read-only gate inspection changed inventory");
     check(commands.mutations == previous, "Gate inspection mutated network state");
@@ -537,12 +661,24 @@ void device_tests(Fixture &fixture) {
     check(commands.mutations == previous, "Normalized gate inspection mutated network state");
     device.start(identity, device_deadline());
     device.stop(device_deadline());
+    // Upgrade the earlier timed gate without local self traffic, withdrawing every permission.
+    auto old_timed = commands.firewall;
+    old_timed.erase(std::remove_if(old_timed.begin(), old_timed.end(), [](const Json &object) {
+      return object.contains("rule") && object["rule"]["expr"].dump().find("\"lo\"") != std::string::npos;
+    }), old_timed.end());
+    commands.firewall = old_timed;
+    device.start(identity, device_deadline());
+    wg::inspect_guard(fixture.a, commands, device_deadline());
+    for (const auto &object : commands.firewall) if (object.contains("set")) {
+      check(!object["set"].contains("elem"), "Timed gate migration retained workload permissions");
+    }
+    device.stop(device_deadline());
     // Reconstruct the exact previous closed gate; upgrade must remain a single transaction.
     auto legacy = commands.firewall;
     legacy.erase(std::remove_if(legacy.begin(), legacy.end(), [](const Json &object) {
       if (object.contains("set")) return true;
       return object.contains("rule") && (object["rule"]["expr"].dump().find("51823") != std::string::npos ||
-          object["rule"]["expr"].dump().find("@active_peers") != std::string::npos);
+          object["rule"]["expr"].dump().find("@ready_node") != std::string::npos);
     }), legacy.end());
     commands.firewall = legacy;
     auto upgrade_begin = commands.calls.size();
@@ -994,6 +1130,8 @@ void integration_peer(Fixture &fixture, bool server, const char *namespace_path)
         session.synchronize("workload-sent");
         pollfd item{workload, POLLIN, 0};
         check(poll(&item, 1, 150) == 0, "Closed workload gate allowed inference UDP");
+        sendto(workload, "blocked", 7, 0, reinterpret_cast<sockaddr *>(&local), sizeof(local));
+        check(poll(&item, 1, 150) == 0, "Closed workload gate allowed local overlay self traffic");
         session.synchronize("workload-blocked");
         device.check_inventory(deadline);
         auto until = wg::Deadline::Clock::now() + std::chrono::seconds(6);
@@ -1007,6 +1145,12 @@ void integration_peer(Fixture &fixture, bool server, const char *namespace_path)
         auto length = recv(workload, message.data(), message.size(), 0);
         check(length == 7 && std::string(message.data(), 7) == "allowed", "Authorized workload packet changed");
         session.synchronize("workload-allowed");
+        check(sendto(workload, "local", 5, 0, reinterpret_cast<sockaddr *>(&local), sizeof(local)) == 5,
+              "Cannot send authorized local overlay self traffic");
+        check(poll(&item, 1, 1000) > 0, "Ready group did not permit local overlay self traffic");
+        length = recv(workload, message.data(), message.size(), 0);
+        check(length == 5 && std::string(message.data(), 5) == "local", "Local overlay self packet changed");
+        session.synchronize("local-workload-allowed");
         // Simulate a dead/hung refresher: the kernel must expire permissions while WireGuard stays up.
         auto expiry_wait = wg::Deadline::Clock::now() + std::chrono::seconds(5);
         while (wg::Deadline::Clock::now() < expiry_wait) deadline.wait(-1, 0);
@@ -1014,6 +1158,8 @@ void integration_peer(Fixture &fixture, bool server, const char *namespace_path)
         sendto(workload, "expired", 7, 0, reinterpret_cast<sockaddr *>(&remote), sizeof(remote));
         session.synchronize("workload-expired-sent");
         check(poll(&item, 1, 150) == 0, "Expired kernel permission retained workload access");
+        sendto(workload, "expired", 7, 0, reinterpret_cast<sockaddr *>(&local), sizeof(local));
+        check(poll(&item, 1, 150) == 0, "Expired readiness retained local overlay self traffic");
         close(workload);
         session.synchronize("workload-expired");
       });
@@ -1205,7 +1351,7 @@ int main(int argc, char **argv) {
       network_integration(argv[2], argv[3]);
       return 0;
     }
-    worker_tests(); policy_tests(); quote_parser_tests(); fake_tee_tests();
+    worker_tests(); policy_tests(); tls_key_permissions_tests(); quote_parser_tests(); fake_tee_tests();
     Fixture fixture;
     transcript_tests(fixture);
     device_tests(fixture);

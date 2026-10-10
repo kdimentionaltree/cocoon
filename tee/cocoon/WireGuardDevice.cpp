@@ -124,9 +124,21 @@ class RealNetworkCommands final : public NetworkCommands {
       }
       if ((n <= 0 || eof) && (!eof || !exited)) deadline.wait(eof ? -1 : out.value, POLLIN);
     }
-    // Helper diagnostics can echo key input; never put them in exceptions or status.
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-      throw Error(std::string("Guest network helper failed: ") + executable(tool));
+      std::string message = std::string("Guest network helper failed: ") + executable(tool);
+      if (WIFEXITED(status)) message += " (exit " + std::to_string(WEXITSTATUS(status)) + ")";
+      else if (WIFSIGNALED(status)) message += " (signal " + std::to_string(WTERMSIG(status)) + ")";
+      // nft receives only public firewall rules. WireGuard diagnostics can echo private key
+      // input, so those remain suppressed even for invocations without a key descriptor.
+      if (tool == NetworkTool::Nftables) {
+        auto diagnostic = output.bytes.substr(0, 4096);
+        for (auto &byte : diagnostic) {
+          auto value = static_cast<unsigned char>(byte);
+          if (value < 32 || value == 127) byte = ' ';
+        }
+        if (!diagnostic.empty()) message += ": " + diagnostic;
+      }
+      throw Error(message);
     }
     return output.sensitive ? std::string() : std::move(output.bytes);
   }
@@ -167,7 +179,7 @@ Json payload(const char *protocol, const char *field) { return {{"payload", {{"p
 Json meta(const char *key) { return {{"meta", {{"key", key}}}}; }
 
 // A static closed gate, independently retained after the interface disappears. No conntrack accept rule.
-Json guard_objects(const Config &config, bool legacy = false) {
+Json guard_objects(const Config &config, bool legacy = false, bool local_self = true) {
   std::string table = "cwg_" + config.interface;
   Json objects = Json::array({{{"table", {{"family", "inet"}, {"name", table}}}}});
   if (!legacy) {
@@ -200,6 +212,14 @@ Json guard_objects(const Config &config, bool legacy = false) {
             match(payload("ip", "daddr"), input ? config.overlay_ipv4 : peer.overlay_ipv4),
             match(payload("ip", input ? "saddr" : "daddr"), "@active_peers"),
             match(payload("ip", input ? "daddr" : "saddr"), "@ready_node"), {{"accept", nullptr}}}));
+      }
+      if (!legacy && local_self) {
+        // Distributed rendezvous also connects to this node's own overlay address via loopback.
+        // It gets the same expiring group-readiness permission, never an unconditional bypass.
+        add_rule(chain, Json::array({match(meta(chain == "input" ? "iifname" : "oifname"), "lo"),
+            match(payload("ip", "saddr"), config.overlay_ipv4),
+            match(payload("ip", "daddr"), config.overlay_ipv4),
+            match(payload("ip", "saddr"), "@ready_node"), {{"accept", nullptr}}}));
       }
     }
     for (const char *field : {"saddr", "daddr"}) {
@@ -305,9 +325,10 @@ void install_closed_guard(const Config &config, NetworkCommands &commands, const
     if (normalize_guard(current["nftables"]) == normalize_guard(expected)) {
       transaction = flush_permissions(config);
     } else {
-      require(normalize_guard(current["nftables"]) == normalize_guard(guard_objects(config, true)),
+      require(normalize_guard(current["nftables"]) == normalize_guard(guard_objects(config, true)) ||
+                  normalize_guard(current["nftables"]) == normalize_guard(guard_objects(config, false, false)),
               "Existing overlay firewall differs from the owned gate");
-      // Upgrade only the exact closed step-3 gate, atomically; unrelated tables are never adopted.
+      // Upgrade only exact known earlier gates, atomically and with every permission withdrawn.
       transaction.push_back({{"delete", {{"table", {{"family", "inet"}, {"name", "cwg_" + config.interface}}}}}});
       create = true;
     }
@@ -359,9 +380,11 @@ void WireGuardDevice::start(const RuntimeIdentity &identity, const Deadline &dea
   // From here every partial failure leaves the independently closed gate in place.
   ownership_alias_ = "cocoon-wireguard:" + identity.identity().boot_id;
   try {
-    // Alias is part of the atomic create request. A timed-out helper may already have created the link.
+    // Keep the alias in the create request for kernels that honor it. Others discard
+    // IFLA_IFALIAS on creation, so explicitly mark ownership before installing keys or addresses.
     owns_interface_ = true;
     command(NetworkTool::Ip, {"link", "add", "dev", config_.interface, "alias", ownership_alias_, "type", "wireguard"}, deadline);
+    command(NetworkTool::Ip, {"link", "set", "dev", config_.interface, "alias", ownership_alias_}, deadline);
     command(NetworkTool::WireGuard, {"set", config_.interface, "listen-port", std::to_string(config_.listen_port),
         "private-key", "/proc/self/fd/3"}, deadline, {}, identity.key_fd());
     auto public_key = command(NetworkTool::WireGuard, {"show", config_.interface, "public-key"}, deadline);

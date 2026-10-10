@@ -5,6 +5,11 @@ from pathlib import Path
 import sys
 
 
+# iptables-nft uses the compatibility layer for our ownership comment match.
+# Those modules are loaded on demand and are not dependencies of nf_tables.
+REQUIRED_MODULES = ('wireguard', 'nf_tables', 'nft_compat', 'xt_comment')
+
+
 def module_name(path):
     return Path(path).name.split('.ko', 1)[0].replace('-', '_')
 
@@ -51,7 +56,7 @@ def closure(directory):
         pending.remove(path)
         selected.add(path)
 
-    for name in ('wireguard', 'nf_tables'):
+    for name in REQUIRED_MODULES:
         if name in by_name:
             visit(by_name[name])
         elif name not in builtins:

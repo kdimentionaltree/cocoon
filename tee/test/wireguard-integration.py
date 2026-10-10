@@ -264,7 +264,9 @@ class IntegrationTests(unittest.TestCase):
         unit = (ROOT / 'scripts/wireguard/systemd/cocoon-wireguard.service').read_text()
         self.assertNotIn('After=spec.service', unit)
         self.assertIn('--membership /mnt/spec/runtime/cluster-membership.json', unit)
-        self.assertNotIn('cocoon-wireguard.service', (ROOT / 'reprodebian/mkosi.postinst').read_text())
+        postinst = (ROOT / 'reprodebian/mkosi.postinst').read_text()
+        self.assertNotIn('systemctl enable cocoon-wireguard.service', postinst)
+        self.assertIn('systemctl disable cocoon-wireguard.service', postinst)
 
     def test_bootstrap_accepts_only_a_current_signed_guest_identity(self):
         self.guest_fixture()
@@ -306,11 +308,15 @@ class IntegrationTests(unittest.TestCase):
     def test_kernel_dependency_metadata_and_pruning(self):
         kernel = self.root / 'kernel'; kernel.mkdir()
         files = ['kernel/drivers/net/wireguard/wireguard.ko.xz', 'kernel/net/ipv4/udp_tunnel.ko.xz',
-                 'kernel/lib/crypto/libcurve25519.ko.xz', 'kernel/net/netfilter/nf_tables.ko.xz']
+                 'kernel/lib/crypto/libcurve25519.ko.xz', 'kernel/net/netfilter/nf_tables.ko.xz',
+                 'kernel/net/netfilter/nft_compat.ko.xz', 'kernel/net/netfilter/xt_comment.ko.xz',
+                 'kernel/net/netfilter/x_tables.ko.xz']
         for name in files:
             path = kernel / name; path.parent.mkdir(parents=True, exist_ok=True); path.touch()
         (kernel / 'modules.dep').write_text(f'{files[0]}: {files[1]} {files[2]}\n' +
-                                          '\n'.join(f'{name}:' for name in files[1:]) + '\n')
+                                          f'{files[4]}: {files[3]} {files[6]}\n' +
+                                          f'{files[5]}: {files[6]}\n' +
+                                          '\n'.join(f'{files[i]}:' for i in (1, 2, 3, 6)) + '\n')
         (kernel / 'modules.builtin').write_text('kernel/lib/crypto/libchacha.ko\n')
         self.assertEqual(modules.closure(kernel), sorted(files))
         (kernel / files[2]).unlink()
@@ -321,15 +327,41 @@ class IntegrationTests(unittest.TestCase):
 
     def test_builtin_and_missing_wireguard(self):
         (self.root / 'modules.dep').write_text('')
-        (self.root / 'modules.builtin').write_text('kernel/drivers/net/wireguard/wireguard.ko\nkernel/net/netfilter/nf_tables.ko\n')
+        builtins = ('kernel/drivers/net/wireguard/wireguard.ko\n'
+                    'kernel/net/netfilter/nf_tables.ko\n'
+                    'kernel/net/netfilter/nft_compat.ko\n'
+                    'kernel/net/netfilter/xt_comment.ko\n')
+        (self.root / 'modules.builtin').write_text(builtins)
         self.assertEqual(modules.closure(self.root), [])
-        (self.root / 'modules.builtin').write_text('kernel/net/netfilter/nf_tables.ko\n')
+        (self.root / 'modules.builtin').write_text(builtins.replace('kernel/drivers/net/wireguard/wireguard.ko\n', ''))
         with self.assertRaisesRegex(ValueError, 'no wireguard'): modules.closure(self.root)
+
+    def test_missing_comment_module_rejected_before_pruning(self):
+        (self.root / 'modules.dep').write_text('')
+        (self.root / 'modules.builtin').write_text(
+            'kernel/drivers/net/wireguard/wireguard.ko\n'
+            'kernel/net/netfilter/nf_tables.ko\n'
+            'kernel/net/netfilter/nft_compat.ko\n')
+        with self.assertRaisesRegex(ValueError, 'no xt_comment'): modules.closure(self.root)
+
+    def test_missing_comment_module_aborts_network_preparation(self):
+        self.guest_fixture()
+        def fail_comment(arguments, **kwargs):
+            self.calls.append(arguments)
+            if arguments == ['/usr/sbin/modprobe', 'xt_comment']:
+                raise subprocess.CalledProcessError(1, arguments)
+            return subprocess.CompletedProcess(arguments, 0, stdout='')
+        with patch.object(guest.subprocess, 'run', side_effect=fail_comment):
+            with self.assertRaises(subprocess.CalledProcessError): guest.prepare_network(config())
+        self.assertFalse(any(args[0] in ('/usr/sbin/iptables', '/usr/bin/cocoon-wireguard') for args in self.calls))
+        self.assertFalse((self.state / 'enrollment.json').exists())
 
     def test_guest_installer_stages_binary_helper_and_disabled_unit(self):
         source = self.root / 'source'; source.mkdir()
         buildroot = self.root / 'buildroot'; buildroot.mkdir()
         destination = self.root / 'image'; destination.mkdir()
+        (destination / 'usr/lib').mkdir(parents=True)
+        (destination / 'lib').symlink_to('usr/lib')
         sdk = buildroot / 'opt/intel/sgxsdk'; sdk.mkdir(parents=True)
         (sdk / 'environment').write_text(':\n')
         cocoon = source / 'cocoon'; cocoon.mkdir()
@@ -372,7 +404,15 @@ class IntegrationTests(unittest.TestCase):
                          (ROOT / 'scripts/wireguard/collective.py').read_text())
         unit = destination / 'lib/systemd/system/cocoon-wireguard.service'
         self.assertEqual(unit.read_text(), (ROOT / 'scripts/wireguard/systemd/cocoon-wireguard.service').read_text())
-        self.assertFalse((destination / 'etc/systemd/system/multi-user.target.wants/cocoon-wireguard.service').exists())
+        # Mkosi applies presets after installation. Exercise that real step: the previous
+        # WantedBy enabled the overlay here, racing specialization during the first boot.
+        (destination / 'etc/systemd/system').mkdir(parents=True, exist_ok=True)
+        preset = REAL_RUN(['systemctl', '--root', str(destination), 'preset-all'],
+                          capture_output=True, text=True, timeout=10)
+        self.assertEqual(preset.returncode, 0, preset.stderr)
+        activation = destination / 'etc/systemd/system/multi-user.target.wants/cocoon-wireguard.service'
+        self.assertFalse(activation.is_symlink())
+        self.assertFalse(activation.exists())
 
 
 if __name__ == '__main__':

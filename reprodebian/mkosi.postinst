@@ -7,6 +7,8 @@ mkosi-chroot systemctl enable cocoon-ready.target
 mkosi-chroot systemctl enable cocoon-cert-refresh.timer
 mkosi-chroot systemctl enable cocoon-sev-pki-update.timer
 mkosi-chroot systemctl enable spec.service
+# Remove activation links left by older cached images. Specialization starts the static overlay unit.
+mkosi-chroot systemctl disable cocoon-wireguard.service
 # The overlay owns individual nftables tables; the package's global ruleset service is not its supervisor.
 mkosi-chroot systemctl disable nftables.service
 mkosi-chroot systemctl mask apt-daily.timer apt-daily-upgrade.timer dpkg-db-backup.timer

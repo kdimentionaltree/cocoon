@@ -69,14 +69,19 @@ std::array<unsigned char, 32> state_digest(std::string_view context, const Secre
   return digest;
 }
 
-void private_permissions(int fd, bool directory) {
+void private_permissions(int fd, bool directory, bool allow_read_only = false) {
   struct stat s{};
   if (fstat(fd, &s) != 0) {
     system_error("Cannot inspect private state");
   }
   auto mode = directory ? 0700 : 0600;
+  bool valid_mode = (s.st_mode & 07777) == mode ||
+                    (!directory && allow_read_only && (s.st_mode & 07777) == 0400);
   if ((directory ? !S_ISDIR(s.st_mode) : !S_ISREG(s.st_mode)) || s.st_uid != geteuid() ||
-      (s.st_mode & 07777) != mode || (!directory && s.st_nlink != 1)) {
+      !valid_mode || (!directory && s.st_nlink != 1)) {
+    if (allow_read_only) {
+      throw Error("TLS private key must be owned by this user with exact 0400 or 0600 permissions and no hard links");
+    }
     throw Error("Private state must be owned by this user with exact 0700 directory / 0600 file permissions "
                 "and no hard links");
   }
@@ -208,6 +213,12 @@ std::string read_public_file(const std::string &path) {
 std::string read_private_file(const std::string &path) {
   auto fd = open_regular_file(path);
   private_permissions(fd.value, false);
+  return read_all(fd.value);
+}
+
+std::string read_tls_private_key_file(const std::string &path) {
+  auto fd = open_regular_file(path);
+  private_permissions(fd.value, false, true);
   return read_all(fd.value);
 }
 

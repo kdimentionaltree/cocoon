@@ -204,11 +204,8 @@ class AcceptanceTests(unittest.TestCase):
         with self.assertRaises(ValueError): collective.layout(self.config)
 
     def test_collective_store_listens_only_on_overlay_address(self):
-        # Exercise a real overlay-address listener; only privileged device binding and PyTorch are substituted.
+        # Exercise the actual address-bound listener and TCPStore's local self connection.
         native_socket = socket.socket
-        class DeviceSocket(native_socket):
-            def setsockopt(self, level, option, value):
-                if option != socket.SO_BINDTODEVICE: super().setsockopt(level, option, value)
         addresses = []
         class Dist:
             @staticmethod
@@ -216,10 +213,14 @@ class AcceptanceTests(unittest.TestCase):
                 self.assertFalse(kwargs['use_libuv'])
                 with native_socket(fileno=kwargs['master_listen_fd']) as listener:
                     addresses.append(listener.getsockname())
+                    with native_socket() as client:
+                        client.settimeout(1)
+                        client.connect(listener.getsockname())
+                        connection, _ = listener.accept()
+                        connection.close()
                 return 'store'
         config = copy.deepcopy(self.config); config['overlay_ipv4'] = '127.0.0.1'
-        with patch.object(collective.socket, 'socket', DeviceSocket):
-            self.assertEqual(collective.make_store(Dist, config, '127.0.0.1', 0, 1), 'store')
+        self.assertEqual(collective.make_store(Dist, config, '127.0.0.1', 0, 1), 'store')
         self.assertEqual(addresses[0][0], '127.0.0.1'); self.assertGreater(addresses[0][1], 0)
 
     def test_collective_missing_pytorch_is_explicit_failure(self):

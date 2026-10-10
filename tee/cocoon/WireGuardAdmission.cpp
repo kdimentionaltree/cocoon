@@ -161,6 +161,11 @@ Evidence verify_certificate(X509 *certificate, const Config &config, EvidencePro
   return evidence;
 }
 
+class HandshakeTransportError final : public Error {
+ public:
+  HandshakeTransportError() : Error("Admission TLS transport closed before handshake completion") {}
+};
+
 class Session {
  public:
   Session(SSL *ssl, int socket, const Deadline &deadline, std::function<void()> progress = {})
@@ -172,7 +177,7 @@ class Session {
       ERR_clear_error();
       auto result = SSL_do_handshake(ssl_);
       if (result == 1) break;
-      retry(result);
+      retry(result, true);
     }
     require(SSL_version(ssl_) == TLS1_3_VERSION && !SSL_session_reused(ssl_),
             "Admission requires a full TLS 1.3 handshake");
@@ -199,10 +204,15 @@ class Session {
   }
 
  private:
-  void retry(int result) {
+  void retry(int result, bool handshake = false) {
     auto error = SSL_get_error(ssl_, result);
     if (error == SSL_ERROR_WANT_READ) deadline_.wait(socket_, POLLIN);
     else if (error == SSL_ERROR_WANT_WRITE) deadline_.wait(socket_, POLLOUT);
+    else if (handshake && (error == SSL_ERROR_SYSCALL || error == SSL_ERROR_ZERO_RETURN ||
+             (error == SSL_ERROR_SSL && ERR_GET_LIB(ERR_peek_last_error()) == ERR_LIB_SSL &&
+              ERR_GET_REASON(ERR_peek_last_error()) == SSL_R_UNEXPECTED_EOF_WHILE_READING))) {
+      throw HandshakeTransportError();
+    }
     else throw Error("Admission TLS connection failed");
   }
   void transfer(char *data, std::size_t size, bool write) {
@@ -374,7 +384,7 @@ std::string admit_connected_socket(int socket, bool server, const Config &config
   require(peer_node != config.node_id, "Cannot admit the local node as a peer");
   require((fcntl(socket, F_GETFL) & O_NONBLOCK) != 0, "Admission socket must be nonblocking");
   auto certificate = read_public_file(config.cert_base_name + "_cert.pem");
-  auto private_key = read_private_file(config.cert_base_name + "_key.pem");
+  auto private_key = read_tls_private_key_file(config.cert_base_name + "_key.pem");
   TeeCertAndKey cert_and_key(certificate, private_key);
   OPENSSL_cleanse(private_key.data(), private_key.size());
   std::string verification_error;
@@ -523,9 +533,21 @@ std::string admit_peer(const Config &config, const Identity &identity, std::stri
   Deadline deadline(Deadline::Clock::now() + std::chrono::seconds(config.timeouts.startup_seconds),
                     std::move(cancelled), std::move(progress));
   bool server = config.node_rank > peer->node_rank;
-  auto socket = server ? accept_peer(config.admission_port, deadline) : connect_peer(*peer, deadline);
-  return admit_connected_socket(socket.value, server, config, identity, signed_membership, peer_node,
-                                 *provider, deadline, after_admission);
+  unsigned backoff = 100;
+  for (;;) {
+    deadline.check();
+    try {
+      auto socket = server ? accept_peer(config.admission_port, deadline) : connect_peer(*peer, deadline);
+      return admit_connected_socket(socket.value, server, config, identity, signed_membership, peer_node,
+                                     *provider, deadline, after_admission);
+    } catch (const HandshakeTransportError &) {
+      // VM port forwarding can accept TCP before the guest starts its listener.
+      // Retry only transport closure before TLS finishes; certificate/quote failures remain fatal.
+      auto end = std::min(deadline.end(), Deadline::Clock::now() + std::chrono::milliseconds(backoff));
+      while (Deadline::Clock::now() < end) deadline.wait(-1, 0);
+      backoff = std::min(backoff * 2, 2000U);
+    }
+  }
 }
 
 }  // namespace cocoon::wireguard
